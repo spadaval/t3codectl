@@ -564,7 +564,7 @@ async function uninstall(args: string[]): Promise<void> {
   if (args.includes("--help")) { printHelp(); return; }
   const yes = args.includes("--yes");
   if (args.some((arg) => arg !== "--yes")) die(`unknown uninstall option: ${args.find((arg) => arg !== "--yes")}`, 2);
-  if (!yes && process.stdin.isTTY) {
+  if (!yes) {
     console.error("This removes the T3 Code systemd units and t3codectl configuration, but never T3 Code data.");
     console.error("Re-run with --yes to continue.");
     return;
