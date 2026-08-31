@@ -7,6 +7,7 @@ Small Node.js/TypeScript management CLI for a T3 Code installation.
 ```text
 t3codectl setup
 t3codectl status
+t3codectl pair
 t3codectl update
 t3codectl uninstall --yes
 ```
@@ -22,6 +23,10 @@ prevent unattended updates from consuming the host disk.
 `uninstall` removes only the exact management executable, configuration file,
 and systemd units. It has no recursive deletion path and never deletes the T3
 Code home, database, runtime state, installed versions, or user data.
+
+`pair` asks the running T3 Code server to mint a one-time pairing credential
+and prints the complete pairing URL. Use `--base-url` when the reachable
+address differs from the configured server address.
 
 ## Development
 

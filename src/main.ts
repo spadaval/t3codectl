@@ -31,6 +31,7 @@ type Config = {
   idleCheck: string;
   lockFile: string;
   healthUrl: string;
+  baseUrl: string;
   path: string;
   user: string;
 };
@@ -95,6 +96,7 @@ function loadConfig(overrides: Record<string, string> = {}): Config {
     idleCheck: value(values, "T3CODE_IDLE_CHECK", ""),
     lockFile: value(values, "T3CODE_LOCK_FILE", `/run/user/${process.getuid?.() ?? 0}/t3codectl-update.lock`),
     healthUrl: value(values, "T3CODE_HEALTH_URL", `http://${host}:${port}/.well-known/t3/environment`),
+    baseUrl: value(values, "T3CODE_BASE_URL", `http://${host}:${port}`),
     path,
     user,
   };
@@ -120,6 +122,7 @@ function writeConfig(config: Config): void {
     `T3CODE_STATE_DB=${config.stateDb}`,
     `T3CODE_LOCK_FILE=${config.lockFile}`,
     `T3CODE_HEALTH_URL=${config.healthUrl}`,
+    `T3CODE_BASE_URL=${config.baseUrl}`,
     `T3CODE_PATH=${config.path}`,
     `T3CODE_USER=${config.user}`,
     "",
@@ -434,6 +437,34 @@ async function status(args: string[]): Promise<void> {
   if (!result.health) process.exitCode = 1;
 }
 
+async function pair(args: string[]): Promise<void> {
+  if (args.includes("--help")) { printHelp(); return; }
+  let baseUrl: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--base-url") baseUrl = args[++i] ?? die("--base-url requires a value", 2);
+    else die(`unknown pair option: ${args[i]}`, 2);
+  }
+  const config = loadConfig();
+  const active = await systemctl(config, ["is-active", "--quiet", config.serviceUnit]);
+  if (active.code !== 0) die("T3 Code service is not active");
+  const state = readServiceState(config);
+  if (!state) die("service state is missing or invalid");
+  const target = baseUrl ?? config.baseUrl;
+  try {
+    const parsed = new URL(target);
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("base URL must use http or https");
+  } catch (error) {
+    die(`invalid base URL: ${error instanceof Error ? error.message : String(error)}`, 2);
+  }
+  const env = { ...process.env, HOME: homedir(), PATH: config.path, npm_config_cache: join(config.home, "runtime/npm-cache") };
+  const result = await run(config.npx, ["-y", `t3@${state.activeVersion}`, "auth", "pairing", "create", "--base-dir", config.home, "--base-url", target, "--json", "--log-level", "none"], { env, cwd: config.home });
+  if (result.code !== 0) die(result.stderr.trim() || "T3 Code pairing failed");
+  let output: unknown;
+  try { output = JSON.parse(result.stdout); } catch { die("T3 Code pairing returned invalid JSON"); }
+  if (!output || typeof output !== "object" || typeof (output as { pairUrl?: unknown }).pairUrl !== "string") die("T3 Code did not return a pairing URL");
+  console.log((output as { pairUrl: string }).pairUrl);
+}
+
 const IDLE_QUERY = `PRAGMA query_only=ON;
 BEGIN;
 WITH unknown_counts AS (
@@ -586,12 +617,14 @@ function printHelp(): void {
 Commands:
   setup       Install the CLI, configure systemd, and enable nightly updates
   status      Show service health, running/latest versions, and timer state
+  pair        Generate a fresh T3 Code pairing URL
   update      Apply the latest version when T3 Code is idle
   uninstall   Remove management units and config; never removes T3 Code data
 
 Options:
   status --json
   setup --home PATH --host HOST --port PORT --package TAG --schedule CALENDAR --path PATH
+  pair --base-url URL
   uninstall --yes
 `);
 }
@@ -601,6 +634,7 @@ async function main(): Promise<void> {
   if (command === "help" || command === "--help" || command === "-h") { printHelp(); return; }
   if (command === "setup") return setup(args);
   if (command === "status") return status(args);
+  if (command === "pair") return pair(args);
   if (command === "update") return update(args);
   if (command === "uninstall") return uninstall(args);
   die(`unknown command: ${command}`, 2);

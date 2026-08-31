@@ -4,9 +4,17 @@ import { readFile } from "node:fs/promises";
 
 test("compiled CLI exposes the four-command surface", async () => {
   const source = await readFile(new URL("../dist/main.js", import.meta.url), "utf8");
-  for (const command of ["setup", "status", "update", "uninstall"]) {
+  for (const command of ["setup", "status", "pair", "update", "uninstall"]) {
     assert.match(source, new RegExp(`command === \\"${command}\\"`));
   }
+});
+
+test("pair delegates URL creation to T3 Code", async () => {
+  const source = await readFile(new URL("../dist/main.js", import.meta.url), "utf8");
+  assert.match(source, /auth.*pairing.*create/);
+  assert.match(source, /--base-url/);
+  assert.match(source, /--json/);
+  assert.match(source, /pairUrl/);
 });
 
 test("uninstall is limited to explicit management paths", async () => {
