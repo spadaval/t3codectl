@@ -15,6 +15,10 @@ The default configuration file is `/etc/t3codectl/config.env`. `setup` writes
 the T3 Code service, an update oneshot service, and a nightly systemd timer.
 The timer invokes the same `t3codectl update` command used by an operator.
 
+After a successful update, the active runtime and the two newest previous
+runtime versions are retained. The configured npm cache is then cleaned to
+prevent unattended updates from consuming the host disk.
+
 `uninstall` removes only the exact management executable, configuration file,
 and systemd units. It has no recursive deletion path and never deletes the T3
 Code home, database, runtime state, installed versions, or user data.
