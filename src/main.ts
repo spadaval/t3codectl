@@ -1,7 +1,7 @@
-#!/usr/bin/node
+#!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, accessSync, constants, mkdirSync, readFileSync, renameSync, statfsSync, unlinkSync, writeFileSync, chmodSync, copyFileSync, realpathSync, readdirSync, rmSync, lstatSync } from "node:fs";
+import { existsSync, accessSync, constants, mkdirSync, readFileSync, renameSync, statfsSync, unlinkSync, writeFileSync, chmodSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -65,6 +65,20 @@ function value(values: Record<string, string>, key: string, fallback: string): s
   return values[key] ?? process.env[key] ?? fallback;
 }
 
+function resolveExecutable(command: string, fallback: string): string {
+  if (command.includes("/")) return command;
+  for (const directory of (process.env.PATH ?? "").split(":").filter(Boolean)) {
+    const candidate = join(directory, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return fallback;
+}
+
 function loadConfig(overrides: Record<string, string> = {}): Config {
   const fileValues = parseEnvFile(CONFIG_PATH);
   const values = { ...fileValues, ...overrides };
@@ -73,11 +87,11 @@ function loadConfig(overrides: Record<string, string> = {}): Config {
   const host = value(values, "T3CODE_HOST", "127.0.0.1");
   const port = Number(value(values, "T3CODE_PORT", "3773"));
   if (!Number.isInteger(port) || port < 1 || port > 65535) die(`invalid port: ${port}`, 2);
-  const node = value(values, "T3CODE_NODE", "/usr/bin/node");
-  const npx = value(values, "T3CODE_NPX", "/usr/bin/npx");
-  const npm = value(values, "T3CODE_NPM", "/usr/bin/npm");
-  const sqlite3 = value(values, "T3CODE_SQLITE3", "/usr/bin/sqlite3");
-  const path = value(values, "T3CODE_PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin");
+  const path = value(values, "T3CODE_PATH", process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin");
+  const node = value(values, "T3CODE_NODE", resolveExecutable("node", "/usr/bin/node"));
+  const npx = value(values, "T3CODE_NPX", resolveExecutable("npx", "/usr/bin/npx"));
+  const npm = value(values, "T3CODE_NPM", resolveExecutable("npm", "/usr/bin/npm"));
+  const sqlite3 = value(values, "T3CODE_SQLITE3", resolveExecutable("sqlite3", "/usr/bin/sqlite3"));
   return {
     configPath: CONFIG_PATH,
     home,
@@ -257,22 +271,6 @@ WantedBy=timers.target
   return { update, timer };
 }
 
-function installSelf(): void {
-  requireRoot();
-  const source = realpathSync(process.argv[1]);
-  mkdirSync(dirname(INSTALL_PATH), { recursive: true });
-  try {
-    if (lstatSync(INSTALL_PATH).isSymbolicLink()) {
-      if (realpathSync(INSTALL_PATH) !== source) die(`${INSTALL_PATH} is managed by a different installation; reinstall t3codectl before running setup`);
-      return;
-    }
-  } catch {
-    // The fixed installation path does not exist yet.
-  }
-  if (source !== INSTALL_PATH) copyFileSync(source, INSTALL_PATH);
-  chmodSync(INSTALL_PATH, 0o755);
-}
-
 async function setup(args: string[]): Promise<void> {
   requireRoot();
   const overrides: Record<string, string> = {};
@@ -296,7 +294,7 @@ async function setup(args: string[]): Promise<void> {
   validateExecutable(config.npx, "npx");
   validateExecutable(config.npm, "npm");
   validateExecutable(config.sqlite3, "sqlite3");
-  installSelf();
+  validateExecutable(INSTALL_PATH, "t3codectl");
   writeConfig(config);
   mkdirSync(unitDirectory(), { recursive: true, mode: 0o700 });
   const nativeInstall = await t3Service(config, "install");
@@ -316,7 +314,7 @@ async function setup(args: string[]): Promise<void> {
   console.log(`configured ${config.serviceUnit} through T3 Code`);
   console.log(`configured ${dropinPath(config.serviceUnit)}`);
   console.log(`configured and enabled ${config.timerUnit} (${config.schedule})`);
-  console.log(`installed ${INSTALL_PATH}`);
+  console.log(`using ${INSTALL_PATH}`);
 }
 
 function parseKeyValueOutput(text: string): Record<string, string> {
@@ -600,8 +598,14 @@ async function update(args: string[]): Promise<void> {
   const config = loadConfig();
   if (internal) { process.exitCode = await updateLocked(config); return; }
   mkdirSync(dirname(config.lockFile), { recursive: true, mode: 0o700 });
-  const self = resolve(process.argv[1]);
-  const result = await run("/usr/bin/flock", ["-n", "-E", "75", config.lockFile, process.execPath, self, "update", "--internal-locked"], { env: systemdEnv(config), inherit: true });
+  const entry = process.argv[1];
+  const bundledBun = process.versions.bun !== undefined && entry?.startsWith("/$bunfs/");
+  const invocation = bundledBun
+    ? { command: process.execPath, args: [] }
+    : entry && existsSync(entry)
+    ? { command: process.execPath, args: [entry] }
+    : { command: process.execPath, args: [] };
+  const result = await run("/usr/bin/flock", ["-n", "-E", "75", config.lockFile, invocation.command, ...invocation.args, "update", "--internal-locked"], { env: systemdEnv(config), inherit: true });
   if (result.code === 75) {
     console.log("update deferred: another update is already running");
     process.exitCode = 0;
@@ -649,7 +653,8 @@ Options:
 }
 
 async function main(): Promise<void> {
-  const [command = "help", ...args] = process.argv.slice(2);
+  const bundledBun = process.versions.bun !== undefined && process.argv[1]?.startsWith("/$bunfs/");
+  const [command = "help", ...args] = process.argv.slice(bundledBun ? 2 : 1);
   if (command === "help" || command === "--help" || command === "-h") { printHelp(); return; }
   if (command === "setup") return setup(args);
   if (command === "status") return status(args);

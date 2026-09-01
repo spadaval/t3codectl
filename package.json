@@ -3,23 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "files": [
-    "dist",
-    "README.md"
-  ],
-  "bin": {
-    "t3codectl": "dist/main.js"
-  },
   "scripts": {
-    "build": "tsc",
-    "prepare": "npm run build",
+    "build": "bun build src/main.ts --compile --target=bun-linux-x64-baseline --outfile=dist/t3codectl-linux-x64",
     "test": "npm run build && node --test test/*.test.mjs"
   },
-  "engines": {
-    "node": ">=22"
-  },
-  "devDependencies": {
-    "@types/node": "^22.15.0",
-    "typescript": "^5.8.3"
-  }
+  "devDependencies": {}
 }
