@@ -37,3 +37,17 @@ test("T3 owns the server unit and t3codectl uses a drop-in for server settings",
   assert.match(source, /Environment=T3CODE_HOST=/);
   assert.match(source, /Environment=T3CODE_PORT=/);
 });
+
+test("package installs as a real CLI and builds GitHub installs", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(packageJson.bin.t3codectl, "dist/main.js");
+  assert.equal(packageJson.scripts.prepare, "npm run build");
+  assert.ok(packageJson.files.includes("dist"));
+});
+
+test("setup can bootstrap an empty T3 Code home through T3", async () => {
+  const source = await readFile(new URL("../dist/main.js", import.meta.url), "utf8");
+  const setup = source.slice(source.indexOf("async function setup"), source.indexOf("function parseKeyValueOutput"));
+  assert.doesNotMatch(setup, /if \(!existsSync\(config\.home\)\)/);
+  assert.match(source, /command === "install" \? homedir\(\) : config\.home/);
+});

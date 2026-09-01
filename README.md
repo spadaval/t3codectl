@@ -12,6 +12,30 @@ t3codectl update
 t3codectl uninstall --yes
 ```
 
+## Installation
+
+The repository is private, so clone it with `gh` and install the package
+globally. The package's `prepare` script builds the TypeScript entrypoint
+automatically:
+
+```bash
+gh repo clone spadaval/t3codectl /root/t3codectl
+npm install --global /root/t3codectl
+```
+
+For a public mirror, the equivalent direct install is
+`npm install --global github:spadaval/t3codectl`.
+
+Then configure the host directly through the installed command:
+
+```bash
+t3codectl setup --host t3.example.com --port 3773 --package nightly
+```
+
+`setup` asks T3 Code to install its own background service, so no separate T3
+service-installation step is required. The T3 Code home may be created by that
+native installation.
+
 The default configuration file is `/etc/t3codectl/config.env`. `setup` asks T3
 Code to install or repair its own `t3code.service`, then writes a small
 systemd drop-in at `~/.config/systemd/user/t3code.service.d/10-t3codectl.conf`

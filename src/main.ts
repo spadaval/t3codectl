@@ -1,7 +1,7 @@
 #!/usr/bin/node
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, accessSync, constants, mkdirSync, readFileSync, renameSync, statfsSync, unlinkSync, writeFileSync, chmodSync, copyFileSync, realpathSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, accessSync, constants, mkdirSync, readFileSync, renameSync, statfsSync, unlinkSync, writeFileSync, chmodSync, copyFileSync, realpathSync, readdirSync, rmSync, lstatSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -170,7 +170,7 @@ async function systemctl(config: Config, args: string[], inherit = false): Promi
 
 async function t3Service(config: Config, command: "install" | "update", version = config.packageTag): Promise<CommandResult> {
   const env = { ...process.env, HOME: homedir(), PATH: config.path, npm_config_cache: join(config.home, "runtime/npm-cache") };
-  return run(config.npx, ["-y", `t3@${version}`, "service", command, "--base-dir", config.home], { env, cwd: config.home, inherit: true });
+  return run(config.npx, ["-y", `t3@${version}`, "service", command, "--base-dir", config.home], { env, cwd: command === "install" ? homedir() : config.home, inherit: true });
 }
 
 function requireRoot(): void {
@@ -261,6 +261,14 @@ function installSelf(): void {
   requireRoot();
   const source = realpathSync(process.argv[1]);
   mkdirSync(dirname(INSTALL_PATH), { recursive: true });
+  try {
+    if (lstatSync(INSTALL_PATH).isSymbolicLink()) {
+      if (realpathSync(INSTALL_PATH) !== source) die(`${INSTALL_PATH} is managed by a different installation; reinstall t3codectl before running setup`);
+      return;
+    }
+  } catch {
+    // The fixed installation path does not exist yet.
+  }
   if (source !== INSTALL_PATH) copyFileSync(source, INSTALL_PATH);
   chmodSync(INSTALL_PATH, 0o755);
 }
@@ -288,11 +296,9 @@ async function setup(args: string[]): Promise<void> {
   validateExecutable(config.npx, "npx");
   validateExecutable(config.npm, "npm");
   validateExecutable(config.sqlite3, "sqlite3");
-  if (!existsSync(config.home)) die(`T3 Code home does not exist: ${config.home}`);
   installSelf();
   writeConfig(config);
   mkdirSync(unitDirectory(), { recursive: true, mode: 0o700 });
-  mkdirSync(join(config.home, "userdata/logs"), { recursive: true, mode: 0o700 });
   const nativeInstall = await t3Service(config, "install");
   if (nativeInstall.code !== 0) die(nativeInstall.stderr.trim() || "T3 Code service installation failed");
   mkdirSync(dropinDirectory(config.serviceUnit), { recursive: true, mode: 0o700 });
