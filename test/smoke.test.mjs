@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 
 test("compiled CLI exposes the command surface", async () => {
   const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
-  for (const command of ["setup", "status", "pair", "update", "uninstall"]) {
+  for (const command of ["setup", "repair", "status", "pair", "update", "uninstall"]) {
     assert.match(source, new RegExp(`command === \\"${command}\\"`));
   }
 });
@@ -31,11 +31,11 @@ test("uninstall is limited to explicit management paths", async () => {
 
 test("T3 owns the server unit and t3codectl uses a drop-in for server settings", async () => {
   const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
-  const setup = source.slice(source.indexOf("async function setup"), source.indexOf("function parseKeyValueOutput"));
-  assert.match(setup, /t3Service\(config, "install"\)/);
-  assert.match(setup, /renderT3Dropin\(config\)/);
-  assert.match(setup, /dropinPath\(config\.serviceUnit\)/);
-  assert.doesNotMatch(setup, /writeFileSync\(unitPath\(config\.serviceUnit\)/);
+  const apply = source.slice(source.indexOf("async function applyConfiguration"), source.indexOf("async function setup"));
+  assert.match(source, /t3Service\(config, "install"\)/);
+  assert.match(apply, /renderT3Dropin\(config\)/);
+  assert.match(apply, /dropinPath\(config\.serviceUnit\)/);
+  assert.doesNotMatch(apply, /writeFileSync\(unitPath\(config\.serviceUnit\)/);
   assert.match(source, /Environment=T3CODE_HOST=/);
   assert.match(source, /Environment=T3CODE_PORT=/);
 });
@@ -58,6 +58,14 @@ test("setup can bootstrap an empty T3 Code home through T3", async () => {
   assert.match(setup, /Apply this configuration\?/);
 });
 
+test("repair reconciles and verifies an existing installation", async () => {
+  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const repair = source.slice(source.indexOf("async function repair"), source.indexOf("function promptValue"));
+  assert.match(repair, /applyConfiguration\(loadConfig\(\)\)/);
+  assert.match(repair, /no existing T3 Code configuration found/);
+  assert.match(source, /T3 Code did not become healthy/);
+});
+
 test("setup preserves unmanaged config content and avoids needless restarts", async () => {
   const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const config = await readFile(new URL("../src/config.ts", import.meta.url), "utf8");
@@ -67,6 +75,7 @@ test("setup preserves unmanaged config content and avoids needless restarts", as
   assert.match(source, /if \(dropinChanged \|\| active\.code !== 0\)/);
   assert.match(source, /setup prerequisites are not ready/);
   assert.match(source, /Node 22 or newer is required/);
+  assert.match(source, /Waiting for T3 Code to become healthy/);
 });
 
 test("setup defaults to an hourly update schedule", async () => {

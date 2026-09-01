@@ -6,6 +6,7 @@ Small TypeScript/Bun management CLI for a T3 Code installation.
 
 ```text
 t3codectl setup
+t3codectl repair
 t3codectl status
 t3codectl pair
 t3codectl update
@@ -83,6 +84,13 @@ t3codectl status
 t3codectl pair
 ```
 
+If T3 Code is installed but stopped or unhealthy, reconcile the existing
+installation and restart it without changing its configuration:
+
+```bash
+t3codectl repair
+```
+
 Run an update manually at any time with:
 
 ```bash
@@ -100,7 +108,11 @@ The default configuration is `/etc/t3codectl/config.env`.
 systemd drop-in at `~/.config/systemd/user/t3code.service.d/10-t3codectl.conf`
 for the configured host, port, mode, and PATH. It also installs an update
 oneshot service and an hourly systemd timer. The timer invokes the same
-`t3codectl update` command used by an operator.
+`t3codectl update` command used by an operator. Setup waits for T3 Code to
+pass its health checks before reporting success.
+
+`repair` performs the same reconciliation using the existing configuration,
+then restarts T3 Code and waits for it to become healthy.
 
 T3 Code owns `t3code.service` and may rewrite that unit during native service
 updates. The drop-in remains in place, so those updates do not discard the
