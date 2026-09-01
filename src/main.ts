@@ -10,6 +10,7 @@ const INSTALL_PATH = "/usr/local/bin/t3codectl";
 const DEFAULT_SERVICE_UNIT = "t3code.service";
 const DEFAULT_UPDATE_UNIT = "t3codectl-update.service";
 const DEFAULT_TIMER_UNIT = "t3codectl-update.timer";
+const T3CODE_DROPIN_NAME = "10-t3codectl.conf";
 const VERSION_RE = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 type Config = {
@@ -167,6 +168,11 @@ async function systemctl(config: Config, args: string[], inherit = false): Promi
   return run("/usr/bin/systemctl", ["--user", ...args], { env: systemdEnv(config), inherit });
 }
 
+async function t3Service(config: Config, command: "install" | "update", version = config.packageTag): Promise<CommandResult> {
+  const env = { ...process.env, HOME: homedir(), PATH: config.path, npm_config_cache: join(config.home, "runtime/npm-cache") };
+  return run(config.npx, ["-y", `t3@${version}`, "service", command, "--base-dir", config.home], { env, cwd: config.home, inherit: true });
+}
+
 function requireRoot(): void {
   if ((process.getuid?.() ?? 0) !== 0) die("this command must run as root", 2);
 }
@@ -183,39 +189,40 @@ function unitPath(unit: string): string {
   return join(unitDirectory(), unit);
 }
 
+function dropinDirectory(unit: string): string {
+  return join(unitDirectory(), `${unit}.d`);
+}
+
+function dropinPath(unit: string): string {
+  return join(dropinDirectory(unit), T3CODE_DROPIN_NAME);
+}
+
 function unitSafe(valueToCheck: string): void {
   if (!valueToCheck || /[\r\n]/.test(valueToCheck)) die("configuration contains a newline or empty value", 2);
 }
 
-function renderUnits(config: Config): { service: string; update: string; timer: string } {
-  for (const item of [config.home, config.host, config.node, config.npx, config.schedule, config.healthUrl]) unitSafe(item);
-  const launcher = join(config.home, "runtime/service-launcher.mjs");
-  const logPath = join(config.home, "userdata/logs/boot-service.log");
-  const environment = join(config.configPath);
-  const service = `[Unit]
-Description=T3 Code server
-StartLimitIntervalSec=300
-StartLimitBurst=5
+function quoteSystemdValue(valueToQuote: string): string {
+  const escaped = valueToQuote.replaceAll("%", "%%");
+  return /[\s"'\\]/.test(escaped)
+    ? `"${escaped.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
+    : escaped;
+}
 
-[Service]
-Type=simple
-WorkingDirectory=${homedir()}
-EnvironmentFile=-/etc/environment
-EnvironmentFile=${environment}
-Environment=HOME=${homedir()}
-Environment=PATH=${config.path}
-Environment=T3_BOOT_SERVICE_UNIT=${config.serviceUnit}
-ExecStart=${config.node} ${launcher}
-KillMode=mixed
-OOMPolicy=continue
-Restart=always
-RestartSec=5
-StandardOutput=append:${logPath}
-StandardError=append:${logPath}
-
-[Install]
-WantedBy=default.target
+function renderT3Dropin(config: Config): string {
+  for (const item of [homedir(), config.host, config.path]) unitSafe(item);
+  return `[Service]
+Environment=HOME=${quoteSystemdValue(homedir())}
+Environment=PATH=${quoteSystemdValue(config.path)}
+Environment=T3CODE_MODE=${quoteSystemdValue(config.mode)}
+Environment=T3CODE_HOST=${quoteSystemdValue(config.host)}
+Environment=T3CODE_PORT=${config.port}
+Environment=T3CODE_NO_BROWSER=true
 `;
+}
+
+function renderUnits(config: Config): { update: string; timer: string } {
+  for (const item of [config.node, config.npx, config.schedule, config.healthUrl]) unitSafe(item);
+  const environment = join(config.configPath);
   const update = `[Unit]
 Description=Idle-aware T3 Code updater
 After=network-online.target ${config.serviceUnit}
@@ -247,7 +254,7 @@ Unit=${config.updateUnit}
 [Install]
 WantedBy=timers.target
 `;
-  return { service, update, timer };
+  return { update, timer };
 }
 
 function installSelf(): void {
@@ -286,17 +293,22 @@ async function setup(args: string[]): Promise<void> {
   writeConfig(config);
   mkdirSync(unitDirectory(), { recursive: true, mode: 0o700 });
   mkdirSync(join(config.home, "userdata/logs"), { recursive: true, mode: 0o700 });
+  const nativeInstall = await t3Service(config, "install");
+  if (nativeInstall.code !== 0) die(nativeInstall.stderr.trim() || "T3 Code service installation failed");
+  mkdirSync(dropinDirectory(config.serviceUnit), { recursive: true, mode: 0o700 });
+  writeFileSync(dropinPath(config.serviceUnit), renderT3Dropin(config), { mode: 0o644 });
+  chmodSync(dropinPath(config.serviceUnit), 0o644);
   const units = renderUnits(config);
-  writeFileSync(unitPath(config.serviceUnit), units.service, { mode: 0o644 });
   writeFileSync(unitPath(config.updateUnit), units.update, { mode: 0o644 });
   writeFileSync(unitPath(config.timerUnit), units.timer, { mode: 0o644 });
-  for (const unit of [config.serviceUnit, config.updateUnit, config.timerUnit]) chmodSync(unitPath(unit), 0o644);
-  for (const result of [await systemctl(config, ["daemon-reload"]), await systemctl(config, ["enable", config.serviceUnit]), await systemctl(config, ["enable", "--now", config.timerUnit])]) {
+  for (const unit of [config.updateUnit, config.timerUnit]) chmodSync(unitPath(unit), 0o644);
+  for (const result of [await systemctl(config, ["daemon-reload"]), await systemctl(config, ["enable", "--now", config.timerUnit])]) {
     if (result.code !== 0) die(result.stderr.trim() || "systemd setup failed");
   }
   const started = await systemctl(config, ["restart", config.serviceUnit]);
   if (started.code !== 0) die(started.stderr.trim() || "T3 Code service failed to start");
-  console.log(`configured ${config.serviceUnit}`);
+  console.log(`configured ${config.serviceUnit} through T3 Code`);
+  console.log(`configured ${dropinPath(config.serviceUnit)}`);
   console.log(`configured and enabled ${config.timerUnit} (${config.schedule})`);
   console.log(`installed ${INSTALL_PATH}`);
 }
@@ -601,13 +613,14 @@ async function uninstall(args: string[]): Promise<void> {
     return;
   }
   const config = loadConfig();
-  for (const unit of [config.timerUnit, config.updateUnit, config.serviceUnit]) {
+  for (const unit of [config.timerUnit, config.updateUnit]) {
     await systemctl(config, ["disable", "--now", unit]);
   }
   await systemctl(config, ["daemon-reload"]);
-  const allowed = [unitPath(config.timerUnit), unitPath(config.updateUnit), unitPath(config.serviceUnit), config.configPath, INSTALL_PATH];
+  const allowed = [unitPath(config.timerUnit), unitPath(config.updateUnit), dropinPath(config.serviceUnit), config.configPath, INSTALL_PATH];
   for (const path of allowed) if (existsSync(path)) unlinkSync(path);
-  console.log("removed t3codectl management units and configuration");
+  console.log("removed t3codectl updater units, service drop-in, and configuration");
+  console.log(`left ${config.serviceUnit} under T3 Code ownership`);
   console.log(`preserved T3 Code data at ${config.home}`);
 }
 
