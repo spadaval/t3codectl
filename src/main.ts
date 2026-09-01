@@ -1,10 +1,12 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, accessSync, constants, mkdirSync, readFileSync, renameSync, statfsSync, unlinkSync, writeFileSync, chmodSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { cancel, confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
+import { mergeManagedConfig } from "./config.ts";
+import { readIdleState } from "./idle.ts";
 
 const CONFIG_PATH = process.env.T3CODECTL_CONFIG ?? "/etc/t3codectl/config.env";
 const INSTALL_PATH = "/usr/local/bin/t3codectl";
@@ -24,7 +26,6 @@ type Config = {
   node: string;
   npx: string;
   npm: string;
-  sqlite3: string;
   schedule: string;
   serviceUnit: string;
   updateUnit: string;
@@ -92,7 +93,6 @@ function loadConfig(overrides: Record<string, string> = {}): Config {
   const node = value(values, "T3CODE_NODE", resolveExecutable("node", "/usr/bin/node"));
   const npx = value(values, "T3CODE_NPX", resolveExecutable("npx", "/usr/bin/npx"));
   const npm = value(values, "T3CODE_NPM", resolveExecutable("npm", "/usr/bin/npm"));
-  const sqlite3 = value(values, "T3CODE_SQLITE3", resolveExecutable("sqlite3", "/usr/bin/sqlite3"));
   return {
     configPath: CONFIG_PATH,
     home,
@@ -103,8 +103,7 @@ function loadConfig(overrides: Record<string, string> = {}): Config {
     node,
     npx,
     npm,
-    sqlite3,
-    schedule: value(values, "T3CODE_UPDATE_SCHEDULE", "*-*-* 03:00:00"),
+    schedule: value(values, "T3CODE_UPDATE_SCHEDULE", "hourly"),
     serviceUnit: value(values, "T3CODE_SERVICE_UNIT", DEFAULT_SERVICE_UNIT),
     updateUnit: value(values, "T3CODE_UPDATE_UNIT", DEFAULT_UPDATE_UNIT),
     timerUnit: value(values, "T3CODE_TIMER_UNIT", DEFAULT_TIMER_UNIT),
@@ -118,35 +117,40 @@ function loadConfig(overrides: Record<string, string> = {}): Config {
   };
 }
 
-function writeConfig(config: Config): void {
+function configValues(config: Config): Record<string, string> {
+  return {
+    T3CODE_HOME: config.home,
+    T3CODE_HOST: config.host,
+    T3CODE_PORT: String(config.port),
+    T3CODE_MODE: config.mode,
+    T3CODE_PACKAGE: config.packageTag,
+    T3CODE_NODE: config.node,
+    T3CODE_NPX: config.npx,
+    T3CODE_NPM: config.npm,
+    T3CODE_UPDATE_SCHEDULE: config.schedule,
+    T3CODE_SERVICE_UNIT: config.serviceUnit,
+    T3CODE_UPDATE_UNIT: config.updateUnit,
+    T3CODE_TIMER_UNIT: config.timerUnit,
+    T3CODE_STATE_DB: config.stateDb,
+    T3CODE_IDLE_CHECK: config.idleCheck,
+    T3CODE_LOCK_FILE: config.lockFile,
+    T3CODE_HEALTH_URL: config.healthUrl,
+    T3CODE_BASE_URL: config.baseUrl,
+    T3CODE_PATH: config.path,
+    T3CODE_USER: config.user,
+  };
+}
+
+function writeConfig(config: Config): boolean {
+  const existing = existsSync(config.configPath) ? readFileSync(config.configPath, "utf8") : undefined;
+  const content = mergeManagedConfig(existing, configValues(config));
+  if (content === existing) return false;
   mkdirSync(dirname(config.configPath), { recursive: true, mode: 0o755 });
-  const content = [
-    "# Managed by t3codectl. Values are deployment configuration, not T3 Code data.",
-    `T3CODE_HOME=${config.home}`,
-    `T3CODE_HOST=${config.host}`,
-    `T3CODE_PORT=${config.port}`,
-    `T3CODE_MODE=${config.mode}`,
-    `T3CODE_PACKAGE=${config.packageTag}`,
-    `T3CODE_NODE=${config.node}`,
-    `T3CODE_NPX=${config.npx}`,
-    `T3CODE_NPM=${config.npm}`,
-    `T3CODE_SQLITE3=${config.sqlite3}`,
-    `T3CODE_UPDATE_SCHEDULE=${config.schedule}`,
-    `T3CODE_SERVICE_UNIT=${config.serviceUnit}`,
-    `T3CODE_UPDATE_UNIT=${config.updateUnit}`,
-    `T3CODE_TIMER_UNIT=${config.timerUnit}`,
-    `T3CODE_STATE_DB=${config.stateDb}`,
-    `T3CODE_LOCK_FILE=${config.lockFile}`,
-    `T3CODE_HEALTH_URL=${config.healthUrl}`,
-    `T3CODE_BASE_URL=${config.baseUrl}`,
-    `T3CODE_PATH=${config.path}`,
-    `T3CODE_USER=${config.user}`,
-    "",
-  ].join("\n");
   const temp = `${config.configPath}.tmp.${process.pid}`;
   writeFileSync(temp, content, { mode: 0o600 });
   chmodSync(temp, 0o600);
   renameSync(temp, config.configPath);
+  return true;
 }
 
 function systemdEnv(config: Config): NodeJS.ProcessEnv {
@@ -194,6 +198,48 @@ function requireRoot(): void {
 
 function validateExecutable(path: string, label: string): void {
   try { accessSync(path, constants.X_OK); } catch { die(`${label} is not executable: ${path}`); }
+}
+
+async function prerequisiteFailures(config: Config): Promise<string[]> {
+  const failures: string[] = [];
+  const executables = [
+    [config.node, "Node"],
+    [config.npx, "npx"],
+    [config.npm, "npm"],
+    ["/usr/bin/systemctl", "systemctl"],
+    ["/usr/bin/loginctl", "loginctl"],
+    ["/usr/bin/flock", "flock"],
+    ["/usr/sbin/ss", "ss"],
+  ] as const;
+  for (const [path, label] of executables) {
+    try { accessSync(path, constants.X_OK); } catch { failures.push(`${label} is not executable: ${path}`); }
+  }
+  validateExecutable(INSTALL_PATH, "t3codectl");
+
+  const env = { ...process.env, PATH: config.path };
+  if (!failures.some((failure) => failure.startsWith("Node "))) {
+    const node = await run(config.node, ["--version"], { env });
+    const version = node.stdout.trim();
+    const match = version.match(/^v(\d+)\./);
+    if (node.code !== 0 || !match) failures.push(`Node could not report its version (${version || node.stderr.trim() || "unknown error"})`);
+    else if (Number(match[1]) < 22) failures.push(`Node 22 or newer is required (found ${version})`);
+  }
+  for (const [path, label] of [[config.npm, "npm"], [config.npx, "npx"]] as const) {
+    if (failures.some((failure) => failure.startsWith(`${label} `))) continue;
+    const result = await run(path, ["--version"], { env });
+    if (result.code !== 0) failures.push(`${label} could not run (${result.stderr.trim() || "unknown error"})`);
+  }
+  return failures;
+}
+
+function writeManagedFile(path: string, content: string, mode: number): boolean {
+  const existing = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+  if (existing === content) return false;
+  const temp = `${path}.tmp.${process.pid}`;
+  writeFileSync(temp, content, { mode });
+  chmodSync(temp, mode);
+  renameSync(temp, path);
+  return true;
 }
 
 function unitDirectory(): string {
@@ -334,27 +380,30 @@ async function setup(args: string[]): Promise<void> {
     const proceed = promptValue(await confirm({ message: "Apply this configuration?", initialValue: true }));
     if (!proceed) cancelSetup();
   }
-  validateExecutable(config.node, "Node");
-  validateExecutable(config.npx, "npx");
-  validateExecutable(config.npm, "npm");
-  validateExecutable(config.sqlite3, "sqlite3");
-  validateExecutable(INSTALL_PATH, "t3codectl");
-  writeConfig(config);
-  mkdirSync(unitDirectory(), { recursive: true, mode: 0o700 });
+  const failures = await prerequisiteFailures(config);
+  if (failures.length > 0) die(`setup prerequisites are not ready:\n${failures.map((failure) => `- ${failure}`).join("\n")}`, 2);
+  const dropin = renderT3Dropin(config);
+  const units = renderUnits(config);
   const nativeInstall = await t3Service(config, "install");
   if (nativeInstall.code !== 0) die(nativeInstall.stderr.trim() || "T3 Code service installation failed");
+  const configChanged = writeConfig(config);
+  mkdirSync(unitDirectory(), { recursive: true, mode: 0o700 });
   mkdirSync(dropinDirectory(config.serviceUnit), { recursive: true, mode: 0o700 });
-  writeFileSync(dropinPath(config.serviceUnit), renderT3Dropin(config), { mode: 0o644 });
-  chmodSync(dropinPath(config.serviceUnit), 0o644);
-  const units = renderUnits(config);
-  writeFileSync(unitPath(config.updateUnit), units.update, { mode: 0o644 });
-  writeFileSync(unitPath(config.timerUnit), units.timer, { mode: 0o644 });
-  for (const unit of [config.updateUnit, config.timerUnit]) chmodSync(unitPath(unit), 0o644);
-  for (const result of [await systemctl(config, ["daemon-reload"]), await systemctl(config, ["enable", "--now", config.timerUnit])]) {
-    if (result.code !== 0) die(result.stderr.trim() || "systemd setup failed");
+  const dropinChanged = writeManagedFile(dropinPath(config.serviceUnit), dropin, 0o644);
+  const updateUnitChanged = writeManagedFile(unitPath(config.updateUnit), units.update, 0o644);
+  const timerUnitChanged = writeManagedFile(unitPath(config.timerUnit), units.timer, 0o644);
+  if (dropinChanged || updateUnitChanged || timerUnitChanged) {
+    const reloaded = await systemctl(config, ["daemon-reload"]);
+    if (reloaded.code !== 0) die(reloaded.stderr.trim() || "systemd setup failed");
   }
-  const started = await systemctl(config, ["restart", config.serviceUnit]);
-  if (started.code !== 0) die(started.stderr.trim() || "T3 Code service failed to start");
+  const timer = await systemctl(config, ["enable", "--now", config.timerUnit]);
+  if (timer.code !== 0) die(timer.stderr.trim() || "systemd setup failed");
+  const active = await systemctl(config, ["is-active", "--quiet", config.serviceUnit]);
+  if (dropinChanged || active.code !== 0) {
+    const started = await systemctl(config, ["restart", config.serviceUnit]);
+    if (started.code !== 0) die(started.stderr.trim() || "T3 Code service failed to start");
+  }
+  if (!configChanged && !dropinChanged && !updateUnitChanged && !timerUnitChanged && active.code === 0) console.log("configuration already applied; no service restart needed");
   console.log(`configured ${config.serviceUnit} through T3 Code`);
   console.log(`configured ${dropinPath(config.serviceUnit)}`);
   console.log(`configured and enabled ${config.timerUnit} (${config.schedule})`);
@@ -540,31 +589,6 @@ async function pair(args: string[]): Promise<void> {
   console.log((output as { pairUrl: string }).pairUrl);
 }
 
-const IDLE_QUERY = `PRAGMA query_only=ON;
-BEGIN;
-WITH unknown_counts AS (
-  SELECT
-    (SELECT COUNT(*) FROM projection_thread_sessions WHERE status IS NULL OR lower(status) NOT IN ('idle','starting','connecting','running','ready','interrupted','stopped','error')) AS unknown_sessions,
-    (SELECT COUNT(*) FROM projection_turns WHERE state IS NULL OR lower(state) NOT IN ('pending','queued','starting','connecting','running','in_progress','interrupted','completed','error')) AS unknown_turns
-), busy_counts AS (
-  SELECT
-    (SELECT COUNT(*) FROM projection_thread_sessions WHERE active_turn_id IS NOT NULL OR lower(status) IN ('starting','connecting','running')) AS busy_sessions,
-    (SELECT COUNT(*) FROM projection_turns WHERE completed_at IS NULL OR lower(state) IN ('pending','queued','starting','connecting','running','in_progress')) AS busy_turns
-)
-SELECT CASE WHEN unknown_sessions + unknown_turns > 0 THEN 'UNKNOWN' WHEN busy_sessions + busy_turns > 0 THEN 'BUSY' ELSE 'IDLE' END || '|' || unknown_sessions || '|' || unknown_turns || '|' || busy_sessions || '|' || busy_turns FROM unknown_counts, busy_counts;
-COMMIT;`;
-
-async function idle(config: Config): Promise<{ state: "IDLE" | "BUSY" | "UNKNOWN"; detail: string }> {
-  if (!existsSync(config.stateDb)) return { state: "UNKNOWN", detail: "state-db-unreadable" };
-  const result = await run(config.sqlite3, ["-readonly", "-noheader", "-separator", "|", config.stateDb, IDLE_QUERY]);
-  if (result.code !== 0) return { state: "UNKNOWN", detail: "state-query-failed" };
-  const detail = result.stdout.trim();
-  const state = detail.split("|", 1)[0];
-  if (state === "IDLE") return { state, detail };
-  if (state === "BUSY") return { state, detail };
-  return { state: "UNKNOWN", detail: detail || "unexpected-query-result" };
-}
-
 function capacitySufficient(config: Config): boolean {
   try {
     const fs = statfsSync(config.home);
@@ -627,7 +651,7 @@ async function updateLocked(config: Config): Promise<number> {
   if (before.updateStatus === "pending") { console.error("t3codectl: update refused: T3 Code reports a pending update"); return 1; }
   if (before.activeVersion === target) { console.log(`already up to date: ${target}`); return 0; }
   if (compareVersions(target, before.activeVersion) !== 1) { console.error(`t3codectl: refusing non-forward update (${before.activeVersion} → ${target})`); return 1; }
-  const idleResult = await idle(config);
+  const idleResult = readIdleState(config.stateDb);
   console.log(`idle check: ${idleResult.detail}`);
   if (idleResult.state === "BUSY") { console.log("update deferred: T3 Code is busy"); return 0; }
   if (idleResult.state !== "IDLE") { console.error("t3codectl: update refused: idle state is unknown"); return 1; }
@@ -697,7 +721,7 @@ function printHelp(): void {
   console.log(`Usage: t3codectl <command> [options]
 
 Commands:
-  setup       Install the CLI, configure systemd, and enable nightly updates
+  setup       Install the CLI, configure systemd, and enable hourly updates
   status      Show service health, running/latest versions, and timer state
   pair        Generate a fresh T3 Code pairing URL
   update      Apply the latest version when T3 Code is idle

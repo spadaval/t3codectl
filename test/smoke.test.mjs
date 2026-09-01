@@ -58,6 +58,23 @@ test("setup can bootstrap an empty T3 Code home through T3", async () => {
   assert.match(setup, /Apply this configuration\?/);
 });
 
+test("setup preserves unmanaged config content and avoids needless restarts", async () => {
+  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const config = await readFile(new URL("../src/config.ts", import.meta.url), "utf8");
+  assert.match(config, /Comments, ordering, and unknown keys/);
+  assert.match(config, /mergeManagedConfig/);
+  assert.match(source, /if \(content === existing\) return false/);
+  assert.match(source, /if \(dropinChanged \|\| active\.code !== 0\)/);
+  assert.match(source, /setup prerequisites are not ready/);
+  assert.match(source, /Node 22 or newer is required/);
+});
+
+test("setup defaults to an hourly update schedule", async () => {
+  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  assert.match(source, /T3CODE_UPDATE_SCHEDULE\", \"hourly\"/);
+  assert.doesNotMatch(source, /T3CODE_UPDATE_SCHEDULE\", \"\*-\*-\* \*:00:00\"/);
+});
+
 test("compiled release binary is executable", () => {
   const binary = new URL("../dist/t3codectl-linux-x64", import.meta.url).pathname;
   assert.ok(existsSync(binary), `missing release binary: ${binary}`);

@@ -1,6 +1,6 @@
 # t3codectl
 
-Small Node.js/TypeScript management CLI for a T3 Code installation.
+Small TypeScript/Bun management CLI for a T3 Code installation.
 
 ## Commands
 
@@ -14,8 +14,8 @@ t3codectl uninstall --yes
 
 ## Fresh-server setup
 
-The host must run Linux with systemd and have Node.js 22 or newer, npm, npx,
-and sqlite3 available for T3 Code. The server also needs DNS configured for
+The host must run Linux with systemd and have Node.js 22 or newer, npm, and
+npx available for T3 Code. The server also needs DNS configured for
 its reachable hostname and an open firewall port for T3 Code (3773 by
 default). Bun is not required on the server.
 
@@ -25,13 +25,12 @@ latest standalone CLI release:
 ```bash
 sudo -i
 apt-get update
-apt-get install -y sqlite3 gh
+apt-get install -y gh
 
 # Install Node.js 22+ using the host's supported method if needed.
 node --version
 npm --version
 npx --version
-sqlite3 --version
 
 gh auth login
 mkdir -p /tmp/t3codectl
@@ -54,7 +53,9 @@ t3codectl setup
 With a terminal, `setup` presents a guided configuration flow for the T3 Code
 home, reachable hostname or IP, port, release channel, and update schedule.
 It shows a summary and asks for confirmation before making changes. Existing
-configuration values are used as the prompt defaults.
+configuration values are used as the prompt defaults. Setup preserves comments
+and unknown/custom variables in the existing configuration file, and accepting
+the existing values does not restart T3 Code unnecessarily.
 
 For automation or a session without a terminal, provide the required values
 and disable prompts explicitly:
@@ -65,12 +66,15 @@ t3codectl setup \
   --host t3.example.com \
   --port 3773 \
   --package nightly \
-  --schedule '*-*-* 03:00:00'
+  --schedule hourly
 ```
 
 `setup` asks T3 Code to install its own background service, so no separate T3
 service-installation step is required. It may create the T3 Code home, then
-adds the updater service, nightly timer, and persistent service drop-in.
+adds the updater service, hourly timer, and persistent service drop-in.
+Before changing anything, setup verifies Node.js 22+, npm, and npx, plus
+the required system tools (`systemctl`, `loginctl`, `flock`, and `ss`). It does
+not install host runtimes or system packages automatically.
 
 Verify the installation and generate a pairing URL:
 
@@ -95,7 +99,7 @@ The default configuration is `/etc/t3codectl/config.env`.
 `setup` asks T3 Code to install or repair its own `t3code.service`, then writes a small
 systemd drop-in at `~/.config/systemd/user/t3code.service.d/10-t3codectl.conf`
 for the configured host, port, mode, and PATH. It also installs an update
-oneshot service and a nightly systemd timer. The timer invokes the same
+oneshot service and an hourly systemd timer. The timer invokes the same
 `t3codectl update` command used by an operator.
 
 T3 Code owns `t3code.service` and may rewrite that unit during native service
