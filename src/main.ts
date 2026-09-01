@@ -4,6 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, accessSync, constants, mkdirSync, readFileSync, renameSync, statfsSync, unlinkSync, writeFileSync, chmodSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { cancel, confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
 
 const CONFIG_PATH = process.env.T3CODECTL_CONFIG ?? "/etc/t3codectl/config.env";
 const INSTALL_PATH = "/usr/local/bin/t3codectl";
@@ -274,22 +275,65 @@ WantedBy=timers.target
 async function setup(args: string[]): Promise<void> {
   requireRoot();
   const overrides: Record<string, string> = {};
+  const provided = new Set<string>();
+  let nonInteractive = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     const next = () => args[++i] ?? die(`${arg} requires a value`, 2);
-    if (arg === "--home") overrides.T3CODE_HOME = next();
-    else if (arg === "--host") overrides.T3CODE_HOST = next();
-    else if (arg === "--port") overrides.T3CODE_PORT = next();
-    else if (arg === "--package") overrides.T3CODE_PACKAGE = next();
-    else if (arg === "--schedule") overrides.T3CODE_UPDATE_SCHEDULE = next();
-    else if (arg === "--node") overrides.T3CODE_NODE = next();
-    else if (arg === "--npx") overrides.T3CODE_NPX = next();
-    else if (arg === "--npm") overrides.T3CODE_NPM = next();
-    else if (arg === "--path") overrides.T3CODE_PATH = next();
+    if (arg === "--home") { overrides.T3CODE_HOME = next(); provided.add("T3CODE_HOME"); }
+    else if (arg === "--host") { overrides.T3CODE_HOST = next(); provided.add("T3CODE_HOST"); }
+    else if (arg === "--port") { overrides.T3CODE_PORT = next(); provided.add("T3CODE_PORT"); }
+    else if (arg === "--package") { overrides.T3CODE_PACKAGE = next(); provided.add("T3CODE_PACKAGE"); }
+    else if (arg === "--schedule") { overrides.T3CODE_UPDATE_SCHEDULE = next(); provided.add("T3CODE_UPDATE_SCHEDULE"); }
+    else if (arg === "--node") { overrides.T3CODE_NODE = next(); provided.add("T3CODE_NODE"); }
+    else if (arg === "--npx") { overrides.T3CODE_NPX = next(); provided.add("T3CODE_NPX"); }
+    else if (arg === "--npm") { overrides.T3CODE_NPM = next(); provided.add("T3CODE_NPM"); }
+    else if (arg === "--path") { overrides.T3CODE_PATH = next(); provided.add("T3CODE_PATH"); }
+    else if (arg === "--non-interactive") nonInteractive = true;
     else if (arg === "--help") { printHelp(); return; }
     else die(`unknown setup option: ${arg}`, 2);
   }
-  const config = loadConfig(overrides);
+  let config = loadConfig(overrides);
+  const configFileValues = parseEnvFile(CONFIG_PATH);
+  const hasConfiguredHost = Boolean(overrides.T3CODE_HOST ?? configFileValues.T3CODE_HOST ?? process.env.T3CODE_HOST);
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY) && !nonInteractive;
+  if (!interactive) {
+    if (!hasConfiguredHost) die("setup requires --host when no interactive terminal is available", 2);
+  } else {
+    intro("T3 Code setup");
+    const guided: Record<string, string> = {};
+    if (!provided.has("T3CODE_HOME")) guided.T3CODE_HOME = await promptText("Where should T3 Code store its home?", config.home, (valueToCheck) => valueToCheck.trim() ? undefined : "A T3 Code home is required");
+    if (!provided.has("T3CODE_HOST")) guided.T3CODE_HOST = await promptText("What hostname or IP should T3 Code listen on?", hasConfiguredHost ? config.host : undefined, (valueToCheck) => {
+      if (!valueToCheck.trim()) return "A reachable hostname or IP is required";
+      if (/\s|[\r\n/]/.test(valueToCheck)) return "Enter a hostname or IP address, without a scheme or path";
+      return undefined;
+    });
+    if (!provided.has("T3CODE_PORT")) guided.T3CODE_PORT = await promptText("Which port should T3 Code use?", String(config.port), (valueToCheck) => {
+      const port = Number(valueToCheck);
+      return Number.isInteger(port) && port >= 1 && port <= 65535 ? undefined : "Enter a port from 1 to 65535";
+    });
+    if (!provided.has("T3CODE_PACKAGE")) {
+      const packageChoices = [
+        { value: "latest", label: "Stable (latest)" },
+        { value: "nightly", label: "Nightly", hint: "latest development build" },
+        ...(config.packageTag !== "latest" && config.packageTag !== "nightly" ? [{ value: config.packageTag, label: config.packageTag, hint: "current configuration" }] : []),
+      ];
+      guided.T3CODE_PACKAGE = promptValue(await select({ message: "Which T3 Code release channel should updates use?", options: packageChoices, initialValue: packageChoices.some((option) => option.value === config.packageTag) ? config.packageTag : "nightly" }));
+    }
+    if (!provided.has("T3CODE_UPDATE_SCHEDULE")) guided.T3CODE_UPDATE_SCHEDULE = await promptText("When should updates run?", config.schedule, (valueToCheck) => valueToCheck.trim() ? undefined : "An update schedule is required");
+    config = loadConfig({ ...overrides, ...guided });
+    note([
+      `T3 Code home: ${config.home}`,
+      `Listen address: ${config.host}:${config.port}`,
+      `Release channel: ${config.packageTag}`,
+      `Update schedule: ${config.schedule}`,
+      "",
+      "T3 Code will install or repair its native service.",
+      "t3codectl will install the updater timer and service drop-in.",
+    ].join("\n"), "Configuration");
+    const proceed = promptValue(await confirm({ message: "Apply this configuration?", initialValue: true }));
+    if (!proceed) cancelSetup();
+  }
   validateExecutable(config.node, "Node");
   validateExecutable(config.npx, "npx");
   validateExecutable(config.npm, "npm");
@@ -315,6 +359,21 @@ async function setup(args: string[]): Promise<void> {
   console.log(`configured ${dropinPath(config.serviceUnit)}`);
   console.log(`configured and enabled ${config.timerUnit} (${config.schedule})`);
   console.log(`using ${INSTALL_PATH}`);
+  if (interactive) outro("T3 Code setup complete");
+}
+
+function promptValue<T>(valueToCheck: T | symbol): T {
+  if (isCancel(valueToCheck)) cancelSetup();
+  return valueToCheck as T;
+}
+
+async function promptText(message: string, initialValue: string | undefined, validate: (valueToCheck: string) => string | undefined): Promise<string> {
+  return promptValue(await text({ message, ...(initialValue === undefined ? {} : { initialValue }), validate }));
+}
+
+function cancelSetup(): never {
+  cancel("Setup cancelled.");
+  process.exit(0);
 }
 
 function parseKeyValueOutput(text: string): Record<string, string> {
@@ -646,7 +705,7 @@ Commands:
 
 Options:
   status --json
-  setup --home PATH --host HOST --port PORT --package TAG --schedule CALENDAR --path PATH
+  setup [--non-interactive] [--home PATH] [--host HOST] [--port PORT] [--package TAG] [--schedule CALENDAR] [--path PATH]
   pair --base-url URL
   uninstall --yes
 `);

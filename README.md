@@ -48,7 +48,24 @@ Configure the host directly through the installed command. Use a concrete
 DNS name or IP address for `--host`; do not use `0.0.0.0`.
 
 ```bash
-t3codectl setup --host t3.example.com --port 3773 --package nightly
+t3codectl setup
+```
+
+With a terminal, `setup` presents a guided configuration flow for the T3 Code
+home, reachable hostname or IP, port, release channel, and update schedule.
+It shows a summary and asks for confirmation before making changes. Existing
+configuration values are used as the prompt defaults.
+
+For automation or a session without a terminal, provide the required values
+and disable prompts explicitly:
+
+```bash
+t3codectl setup \
+  --non-interactive \
+  --host t3.example.com \
+  --port 3773 \
+  --package nightly \
+  --schedule '*-*-* 03:00:00'
 ```
 
 `setup` asks T3 Code to install its own background service, so no separate T3
@@ -101,7 +118,7 @@ address differs from the configured server address.
 ## Development and releases
 
 ```bash
-npm install -g bun
+bun install
 npm test
 ```
 
@@ -110,6 +127,6 @@ npm test
 tag is pushed. To create a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```

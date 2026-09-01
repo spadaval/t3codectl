@@ -45,6 +45,7 @@ test("package installs as a real CLI and builds GitHub installs", async () => {
   assert.match(packageJson.scripts.build, /bun build .*--compile/);
   assert.match(packageJson.scripts.build, /t3codectl-linux-x64/);
   assert.equal(packageJson.bin, undefined);
+  assert.match(packageJson.dependencies["@clack/prompts"], /^\^/);
 });
 
 test("setup can bootstrap an empty T3 Code home through T3", async () => {
@@ -52,6 +53,9 @@ test("setup can bootstrap an empty T3 Code home through T3", async () => {
   const setup = source.slice(source.indexOf("async function setup"), source.indexOf("function parseKeyValueOutput"));
   assert.doesNotMatch(setup, /if \(!existsSync\(config\.home\)\)/);
   assert.match(source, /command === "install" \? homedir\(\) : config\.home/);
+  assert.match(setup, /intro\("T3 Code setup"\)/);
+  assert.match(setup, /--non-interactive/);
+  assert.match(setup, /Apply this configuration\?/);
 });
 
 test("compiled release binary is executable", () => {
