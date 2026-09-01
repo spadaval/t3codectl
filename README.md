@@ -12,32 +12,61 @@ t3codectl update
 t3codectl uninstall --yes
 ```
 
-## Installation
+## Fresh-server setup
 
-The repository is private, so clone it with `gh` and install the package
-globally. The package's `prepare` script builds the TypeScript entrypoint
-automatically:
+The host must run Linux with systemd and have Node.js 22 or newer, npm,
+sqlite3, git, and `gh` available. The server also needs DNS configured for its
+reachable hostname and an open firewall port for T3 Code (3773 by default).
+
+The repository is private, so authenticate `gh` as the account that will run
+the service, then clone and install the CLI globally. The package's `prepare`
+script builds the TypeScript entrypoint automatically:
 
 ```bash
+sudo -i
+apt-get update
+apt-get install -y sqlite3 git gh
+
+# Install Node.js 22+ using the host's supported method, if it is not present.
+node --version
+npm --version
+sqlite3 --version
+
+gh auth login
 gh repo clone spadaval/t3codectl /root/t3codectl
 npm install --global /root/t3codectl
 ```
 
-For a public mirror, the equivalent direct install is
-`npm install --global github:spadaval/t3codectl`.
-
-Then configure the host directly through the installed command:
+Configure the host directly through the installed command. Use a concrete
+DNS name or IP address for `--host`; do not use `0.0.0.0`.
 
 ```bash
 t3codectl setup --host t3.example.com --port 3773 --package nightly
 ```
 
 `setup` asks T3 Code to install its own background service, so no separate T3
-service-installation step is required. The T3 Code home may be created by that
-native installation.
+service-installation step is required. It may create the T3 Code home, then
+adds the updater service, nightly timer, and persistent service drop-in.
 
-The default configuration file is `/etc/t3codectl/config.env`. `setup` asks T3
-Code to install or repair its own `t3code.service`, then writes a small
+Verify the installation and generate a pairing URL:
+
+```bash
+t3codectl status
+t3codectl pair
+```
+
+Run an update manually at any time with:
+
+```bash
+t3codectl update
+```
+
+For a stable release channel, use `--package latest` instead of
+`--package nightly` during setup.
+
+The default configuration is `/etc/t3codectl/config.env`.
+
+`setup` asks T3 Code to install or repair its own `t3code.service`, then writes a small
 systemd drop-in at `~/.config/systemd/user/t3code.service.d/10-t3codectl.conf`
 for the configured host, port, mode, and PATH. It also installs an update
 oneshot service and a nightly systemd timer. The timer invokes the same
