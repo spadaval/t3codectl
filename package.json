@@ -1,11 +1,11 @@
 {
   "name": "t3codectl",
-  "version": "0.2.0",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "bun build src/main.ts --compile --target=bun-linux-x64-baseline --outfile=dist/t3codectl-linux-x64",
-    "test": "npm run build && node --test test/*.test.mjs"
+    "test": "npm run build && node --test test/*.test.mjs && bun test test/self-update.test.ts"
   },
   "devDependencies": {},
   "dependencies": {
