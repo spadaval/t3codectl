@@ -126,6 +126,14 @@ Run `t3codectl self-update` to update only the CLI.
 Hosts running an older CLI need this release installed once using the download
 steps above; subsequent CLI releases are installed by the timer.
 
+The update report has a **T3 Code** section (version change, idle check,
+install, health), a **Maintenance** section (overload recovery and the CLI
+release check), and ends with a one-line result such as
+`✓ Updated T3 Code to …` or `! Update postponed. T3 Code is still on …`.
+In a terminal, T3's own installer output collapses into a single progress line
+and is printed in full only if it fails. Under systemd, the journal keeps the
+complete installer output.
+
 Each sweep uses a short-lived local auth credential to read T3's orchestration
 API across projects. It resumes at most one eligible thread by sending a
 continuation message in the existing thread, keeping its provider, model,

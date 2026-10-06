@@ -56,13 +56,17 @@ export function failedCapacityRun(projection: any): any | null {
   return isCapacityFailure(errors[0].failure) ? latest : null;
 }
 
+function threadName(thread: any): string {
+  return typeof thread?.title === "string" && thread.title.trim() ? `"${thread.title.trim()}"` : `thread ${thread.id}`;
+}
+
 function stableId(threadId: string, runId: string, kind: string): string {
   return `t3codectl-recovery-${createHash("sha256").update(JSON.stringify([threadId, runId, kind])).digest("hex")}`;
 }
 
 /** Caller holds the updater flock. Persist before sending so uncertain delivery is replayable. */
 export async function recoverThreads(options: {
-  client: RecoveryClient; statePath: string; now?: () => number; log?: (message: string) => void;
+  client: RecoveryClient; statePath: string; now?: () => number; log?: (message: string, level: "ok" | "warn") => void;
 }): Promise<{ resumed: number; errors: number }> {
   const { client, statePath } = options;
   const now = options.now ?? Date.now;
@@ -86,7 +90,7 @@ export async function recoverThreads(options: {
         entry = previous;
       } else {
         const attempts = previous?.messageId === run.userMessageId ? previous.attempts : 0;
-        if (attempts >= MAX_ATTEMPTS) { log(`recovery: ${thread.id} reached the ${MAX_ATTEMPTS}-retry limit; manual continuation required`); continue; }
+        if (attempts >= MAX_ATTEMPTS) { log(`${threadName(thread)} stopped on provider overload ${MAX_ATTEMPTS} times; continue it manually`, "warn"); continue; }
         if (attempts && now() < previous.nextAttemptAt) continue;
         const completedAt = Date.parse(run.completedAt);
         if (!Number.isFinite(completedAt) || now() - completedAt < 5 * 60000) continue;
@@ -103,11 +107,10 @@ export async function recoverThreads(options: {
         text: "The previous turn stopped because the provider reported temporary capacity or overload. Continue the existing task from where it stopped, checking the current state before repeating any actions.",
         attachments: [], createdBy: "agent", creationSource: "server", dispatchMode: { type: "start_immediately" } });
       resumed++;
-      log(`recovery: continued ${thread.id} after capacity failure (attempt ${entry.attempts}/${MAX_ATTEMPTS})`);
+      log(`Resumed ${threadName(thread)}, which stopped on provider overload (attempt ${entry.attempts} of ${MAX_ATTEMPTS})`, "ok");
       // Resume at most one thread per sweep to avoid a burst into the same overload.
       break;
-    } catch { errors++; log(`recovery: ${thread.id} could not be continued; will retry with the same command ID`); }
+    } catch { errors++; log(`Could not resume ${threadName(thread)}; the next run will retry`, "warn"); }
   }
-  log(`recovery sweep: ${resumed} continued, ${errors} errors`);
   return { resumed, errors };
 }

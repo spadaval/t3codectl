@@ -118,8 +118,8 @@ test("updates use the supported native command and only roll back changed state"
   assert.match(update, /update command failed/);
   assert.match(update, /const afterFailure = readServiceState\(config\)/);
   assert.match(update, /if \(unchangedHealth\.ok\).*active runtime was unchanged and is still running.*return updateExecution/s);
-  assert.match(update, /reconcile\(config, target, target\)/);
-  assert.match(update, /reconcile\(config, target, before\.activeVersion, true\)/);
+  assert.match(update, /reconcile\(config, target, target, false, ui,/);
+  assert.match(update, /reconcile\(config, target, before\.activeVersion, true, ui,/);
 });
 
 test("status uses the grouped terminal renderer and preserves detailed tracking", async () => {

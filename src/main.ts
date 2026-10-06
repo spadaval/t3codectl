@@ -6,9 +6,11 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { cancel, confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
 import { mergeManagedConfig, resolveConnectionUrl } from "./config.ts";
-import { readIdleState, readSnapshotIdleState } from "./idle.ts";
+import { readIdleState, readSnapshotIdleState, type IdleResult } from "./idle.ts";
 import { parseServiceState, VERSION_RE } from "./service-state.ts";
 import { renderStatus } from "./status-output.ts";
+import { formatDuration, Ui, type Verdict } from "./ui.ts";
+import { describeHealthReason } from "./health-reason.ts";
 import { readUpdateAttempt, writeUpdateAttempt, type UpdateAttempt, type UpdateAttemptResult } from "./update-state.ts";
 import { selfUpdate } from "./self-update.ts";
 import { writePending, readPending, pendingConnection, needsNativeRepair, type PendingPhase } from "./pending-config.ts";
@@ -55,7 +57,7 @@ type Config = {
 type CommandResult = { code: number; stdout: string; stderr: string };
 type HealthResult = { ok: boolean; reason: string };
 type PortListener = { pid: number; name: string; command: string; cgroup: string; inConfiguredService: boolean; looksLikeT3: boolean };
-type UpdateExecution = { code: number; result: Exclude<UpdateAttemptResult, "running">; error: string | null };
+type UpdateExecution = { code: number; result: Exclude<UpdateAttemptResult, "running">; error: string | null; verdict: Verdict; message: string };
 
 function die(message: string, code = 1): never {
   console.error(`t3codectl: ${message}`);
@@ -180,7 +182,7 @@ function systemdEnv(config: Config): NodeJS.ProcessEnv {
   };
 }
 
-function run(command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; input?: string; inherit?: boolean; timeoutMs?: number } = {}): Promise<CommandResult> {
+function run(command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; input?: string; inherit?: boolean; timeoutMs?: number; onData?: (chunk: string) => void } = {}): Promise<CommandResult> {
   return new Promise((resolveResult) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -191,8 +193,8 @@ function run(command: string, args: string[], options: { env?: NodeJS.ProcessEnv
     let stdout = "";
     let stderr = "";
     if (!options.inherit) {
-      child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
-      child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); options.onData?.(chunk.toString()); });
+      child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); options.onData?.(chunk.toString()); });
     }
     if (options.input !== undefined) child.stdin?.end(options.input);
     child.on("error", (error) => resolveResult({ code: 127, stdout, stderr: `${stderr}${error.message}` }));
@@ -326,8 +328,8 @@ function formatPortListeners(config: Config, listeners: PortListener[]): string 
   ].join("\n");
 }
 
-async function printStartupDiagnostics(config: Config, result: HealthResult, restartFailure?: string): Promise<PortListener[]> {
-  console.error(`T3 Code did not become healthy: ${result.reason}`);
+/** The caller reports the failure itself; this prints the supporting evidence. */
+async function printStartupDiagnostics(config: Config, restartFailure?: string): Promise<PortListener[]> {
   if (restartFailure) console.error(`systemd restart error: ${restartFailure}`);
   const listeners = await portListeners(config);
   console.error(formatPortListeners(config, listeners));
@@ -340,7 +342,7 @@ async function printStartupDiagnostics(config: Config, result: HealthResult, res
 
 function startupFailureMessage(config: Config, result: HealthResult, restartFailure?: string): string {
   const detail = restartFailure ? `; systemd reported: ${restartFailure}` : "";
-  return `T3 Code startup failed (${result.reason})${detail}. See the diagnostics above.`;
+  return `T3 Code startup failed: ${describeHealthReason(result.reason, config.port)}${detail}. See the diagnostics above.`;
 }
 
 async function stopConflictingT3Processes(config: Config, listeners: PortListener[]): Promise<boolean> {
@@ -402,7 +404,7 @@ async function resolvePreexistingPortConflict(config: Config, options: { interac
 }
 
 async function recoverStartupFailure(config: Config, version: string | undefined, failure: HealthResult, options: { interactive: boolean; stopConflicting: boolean; restartFailure?: string }): Promise<HealthResult> {
-  const listeners = await printStartupDiagnostics(config, failure, options.restartFailure);
+  const listeners = await printStartupDiagnostics(config, options.restartFailure);
   const candidates = listeners.filter((listener) => listener.looksLikeT3 && !listener.inConfiguredService);
   if (candidates.length === 0) {
     console.error(`No safe automatic recovery is available. If another application owns port ${config.port}, stop it or choose a different port and run setup again.`);
@@ -424,8 +426,8 @@ async function recoverStartupFailure(config: Config, version: string | undefined
   if (restarted.code !== 0) {
     return { ok: false, reason: `service-restart-failed: ${restarted.stderr.trim() || "systemd restart failed"}` };
   }
-  const recovered = await withProgress("Waiting for T3 Code to become healthy after recovery...", () => waitForHealth(config, version));
-  if (!recovered.ok) await printStartupDiagnostics(config, recovered);
+  const recovered = await awaitHealthy(new Ui(), config, version, "Waiting for T3 Code to become healthy after recovery", "T3 Code is healthy");
+  if (!recovered.ok) await printStartupDiagnostics(config);
   return recovered;
 }
 
@@ -579,10 +581,7 @@ async function applyConfiguration(config: Config, options: { interactive?: boole
   const serviceState = readServiceState(config);
   let healthy: HealthResult = restartFailure
     ? { ok: false, reason: "service-restart-failed" }
-    : await withProgress(
-      "Waiting for T3 Code to become healthy...",
-      () => waitForHealth(config, serviceState?.activeVersion),
-    );
+    : await awaitHealthy(new Ui(), config, serviceState?.activeVersion, "Waiting for T3 Code to become healthy", "T3 Code is healthy");
   if (!healthy.ok) {
     healthy = await recoverStartupFailure(config, serviceState?.activeVersion, healthy, {
       interactive: options.interactive === true,
@@ -912,7 +911,9 @@ function capacitySufficient(config: Config): { ok: boolean; error: string | null
   }
 }
 
-async function reconcile(config: Config, cliVersion: string, targetVersion: string, allowDowngrade = false): Promise<number> {
+/** Run T3's own updater. Journals get its output verbatim; terminals get a
+ * spinner showing its latest line, plus the full output if it fails. */
+async function reconcile(config: Config, cliVersion: string, targetVersion: string, allowDowngrade: boolean, ui: Ui, label: string): Promise<{ code: number; output: string }> {
   const env = {
     ...process.env,
     HOME: homedir(),
@@ -922,13 +923,40 @@ async function reconcile(config: Config, cliVersion: string, targetVersion: stri
   };
   const args = ["-y", `t3@${cliVersion}`, "update", targetVersion, "--base-dir", config.home, "--yes"];
   if (allowDowngrade) args.push("--allow-downgrade");
-  const result = await run(config.npx, args, { env, cwd: config.home, inherit: true });
-  return result.code;
+  if (!ui.live) {
+    ui.step(label);
+    ui.blank();
+    const result = await run(config.npx, args, { env, cwd: config.home, inherit: true });
+    ui.blank();
+    return { code: result.code, output: "" };
+  }
+  let output = "";
+  const result = await ui.wait(label, (progress) => run(config.npx, args, {
+    env: { ...env, NO_COLOR: "1" },
+    cwd: config.home,
+    input: "",
+    onData: (chunk) => {
+      output += chunk;
+      const line = chunk.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").split(/[\r\n]+/).map((part) => part.trim()).filter(Boolean).at(-1);
+      if (line) progress(line);
+    },
+  }));
+  return { code: result.code, output: output.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").trim() };
 }
 
-function pruneRuntimeVersions(config: Config, activeVersion: string): void {
+/** Report a failed `t3 update`, including its output when it was condensed. */
+function reportInstallerFailure(ui: Ui, what: string, installer: { code: number; output: string }): void {
+  ui.fail(`${what} (exit ${installer.code})`);
+  if (!installer.output) return;
+  ui.hint("Output from t3 update:");
+  console.error(installer.output.split(/\r?\n/).map((line) => `      ${line}`).join("\n"));
+}
+
+/** Keep the active and two newest runtimes; returns what was removed. */
+function pruneRuntimeVersions(config: Config, activeVersion: string): { removed: string[]; cacheCleaned: boolean } {
   const versionsDir = resolve(config.home, "runtime/versions");
-  if (!existsSync(versionsDir)) return;
+  const removed: string[] = [];
+  if (!existsSync(versionsDir)) return { removed, cacheCleaned: true };
   const candidates = readdirSync(versionsDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && VERSION_RE.test(entry.name))
     .map((entry) => entry.name)
@@ -939,31 +967,40 @@ function pruneRuntimeVersions(config: Config, activeVersion: string): void {
     const target = resolve(versionsDir, version);
     if (dirname(target) !== versionsDir) die("refusing to prune a path outside the runtime versions directory");
     rmSync(target, { recursive: true, force: true });
-    console.log(`pruned old T3 Code runtime: ${version}`);
+    removed.push(version);
   }
   const cache = join(config.home, "runtime/npm-cache");
   const result = spawnSync(config.npm, ["cache", "clean", "--force"], { env: { ...process.env, HOME: homedir(), PATH: config.path, npm_config_cache: cache }, encoding: "utf8" });
-  if (result.status !== 0) console.error("t3codectl: warning: npm cache cleanup failed");
+  return { removed, cacheCleaned: result.status === 0 };
 }
 
-async function waitForHealth(config: Config, version?: string): Promise<HealthResult> {
+/** Poll until healthy. Failed polls while the server starts are expected, so
+ * they are only reported through `progress`, never as errors. */
+async function waitForHealth(config: Config, version?: string, progress: (detail: string) => void = () => {}): Promise<HealthResult> {
   let last: HealthResult = { ok: false, reason: "health-check-not-run" };
-  let previousReason = "";
   for (let attempt = 0; attempt < 18; attempt++) {
     last = await health(config, version);
     if (last.ok) return last;
-    if (last.reason !== previousReason) {
-      console.log(`health check: ${last.reason}`);
-      previousReason = last.reason;
-    }
+    progress(describeHealthReason(last.reason, config.port));
     if (last.reason === "service-inactive" && attempt >= 1) return last;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 5000));
   }
   return last;
 }
 
-function updateExecution(code: number, result: UpdateExecution["result"], error: string | null = null): UpdateExecution {
-  return { code, result, error };
+/** Wait for health behind a spinner; report the outcome as one line. */
+async function awaitHealthy(ui: Ui, config: Config, version: string | undefined, label: string, success: string): Promise<HealthResult> {
+  const started = Date.now();
+  const result = await ui.wait(label, (progress) => waitForHealth(config, version, progress));
+  if (result.ok) ui.ok(`${success} ${ui.paint(`(ready after ${formatDuration(Date.now() - started)})`, "dim")}`);
+  else ui.fail(`T3 Code did not become healthy: ${describeHealthReason(result.reason, config.port)}`);
+  return result;
+}
+
+/** `message` is the closing verdict shown to people; `error` is what `status` records. */
+function updateExecution(result: UpdateExecution["result"], message: string, error: string | null = null): UpdateExecution {
+  const verdict: Verdict = result === "failed" ? "fail" : result === "deferred" ? "warn" : "ok";
+  return { code: result === "failed" ? 1 : 0, result, error, verdict, message };
 }
 
 function persistUpdateAttempt(attempt: UpdateAttempt): void {
@@ -984,8 +1021,11 @@ async function updateCli(config: Config): Promise<"current" | "updated"> {
     currentVersion: `v${packageJson.version}`,
     runGh: (args) => run("gh", args, { env: systemdEnv(config) }),
   });
-  console.log(result === "updated" ? `t3codectl updated to the latest release` : `t3codectl is current (v${packageJson.version})`);
   return result;
+}
+
+function describeCliUpdate(result: "current" | "updated"): string {
+  return result === "updated" ? "Updated t3codectl to the latest release" : `t3codectl v${packageJson.version} is the latest release`;
 }
 
 async function selfUpdateCommand(args: string[]): Promise<void> {
@@ -994,7 +1034,7 @@ async function selfUpdateCommand(args: string[]): Promise<void> {
   requireRoot();
   if (!installedCli()) die(`self-update requires the installed executable at ${INSTALL_PATH}`, 2);
   const config = loadConfig();
-  if (args.includes("--internal-locked")) { await updateCli(config); return; }
+  if (args.includes("--internal-locked")) { new Ui().ok(describeCliUpdate(await updateCli(config))); return; }
   mkdirSync(dirname(config.lockFile), { recursive: true, mode: 0o700 });
   const result = await run("/usr/bin/flock", ["-n", "-E", "75", config.lockFile, INSTALL_PATH, "self-update", "--internal-locked"], { env: systemdEnv(config), inherit: true });
   if (result.code === 75) console.error("t3codectl: another update is already running");
@@ -1030,21 +1070,25 @@ async function runtimeIdleState(config: Config) {
     : readIdleState(config.stateDb);
 }
 
-async function applyPendingConfiguration(config: Config): Promise<Config> {
+async function applyPendingConfiguration(config: Config, ui: Ui): Promise<Config> {
   const previous = readPendingConfiguration(config);
   if (!previous) return config;
   const record = readPendingRecord(config)!;
+  ui.section("Server settings", "saved by an earlier setup or repair");
   if (record.restartCompleted === true) {
     if (renderT3Dropin(record.applied!) !== renderT3Dropin(config)) throw new Error("server settings changed after restart; run setup again");
-    const verified = await waitForHealth(record.applied!);
-    if (!verified.ok) throw new Error(`pending server configuration failed verification: ${verified.reason}`);
+    const verified = await awaitHealthy(ui, record.applied!, undefined, "Checking the server with the new settings", "The server is healthy with the new settings");
+    if (!verified.ok) throw new Error(`the server did not become healthy with the new settings: ${describeHealthReason(verified.reason, config.port)}`);
     unlinkSync(PENDING_CONFIG_PATH);
+    ui.blank();
     return config;
   }
   const stoppedForRepair = record.nativeRepair && (await systemctl(config, ["is-active", "--quiet", config.serviceUnit])).code !== 0;
-  const idle = stoppedForRepair ? { state: "IDLE", detail: "native repair service stopped" } : await runtimeIdleState(previous);
+  const idle = stoppedForRepair ? { state: "IDLE", summary: "the service is stopped for repair" } : await runtimeIdleState(previous);
   if (idle.state !== "IDLE") {
-    console.log(`server configuration restart deferred: ${idle.detail}`);
+    ui.warn(`Restart postponed: ${idle.summary}`);
+    ui.hint("The new settings will be applied by a later run once T3 Code is idle.");
+    ui.blank();
     return previous;
   }
   if (readFileSync(dropinPath(config.serviceUnit), "utf8") !== renderT3Dropin(config)) throw new Error("pending server settings differ from configuration; run setup again");
@@ -1052,82 +1096,96 @@ async function applyPendingConfiguration(config: Config): Promise<Config> {
   if (record.nativeRepair) await repairNativeService(config, previous);
   else {
     const result = await systemctl(config, ["restart", config.serviceUnit]);
-    if (result.code !== 0) throw new Error("pending server configuration restart failed");
+    if (result.code !== 0) throw new Error("systemd could not restart T3 Code with the new settings");
     writePendingConfiguration(previous, { restartCompleted: true, applied: config });
   }
-  const verified = await waitForHealth(config);
-  if (!verified.ok) throw new Error(`pending server configuration failed verification: ${verified.reason}`);
+  const verified = await awaitHealthy(ui, config, undefined, "Restarting with the new settings", "Restarted with the new settings");
+  if (!verified.ok) throw new Error(`the server did not become healthy with the new settings: ${describeHealthReason(verified.reason, config.port)}`);
   unlinkSync(PENDING_CONFIG_PATH);
-  console.log("pending server configuration applied");
+  ui.blank();
   return config;
 }
 
-async function updateLocked(config: Config): Promise<UpdateExecution> {
+async function safeIdleState(config: Config): Promise<IdleResult> {
+  try { return await runtimeIdleState(config); } catch (error) {
+    return { state: "UNKNOWN", detail: "idle-check-failed", summary: `could not read thread activity (${error instanceof Error ? error.message : String(error)})` };
+  }
+}
+
+/** Update T3 Code when idle. Prints the "T3 Code" section; the caller prints
+ * the closing verdict from the returned message. */
+async function updateLocked(config: Config, ui: Ui): Promise<UpdateExecution> {
+  ui.section("T3 Code", `${config.packageTag} channel`);
   const active = await systemctl(config, ["is-active", "--quiet", config.serviceUnit]);
   if (active.code !== 0) {
-    const error = "T3 Code service is not active; run `t3codectl repair`";
-    console.error(`t3codectl: update refused: ${error}`);
-    return updateExecution(1, "failed", error);
+    ui.fail("The T3 Code service is not running");
+    ui.hint("Run `t3codectl repair` to start it, then update again.");
+    return updateExecution("failed", "T3 Code was not updated.", "T3 Code service is not active; run `t3codectl repair`");
+  }
+  const before = readServiceState(config);
+  if (!before) {
+    ui.fail(`Could not read the installed version from ${join(config.home, "runtime/service-state.json")}`);
+    return updateExecution("failed", "T3 Code was not updated.", "service state is missing or invalid");
+  }
+  const still = `T3 Code is still on ${before.activeVersion}.`;
+  if (before.updateStatus === "pending") {
+    ui.fail("T3 Code reports that another update is already in progress");
+    return updateExecution("failed", `Update skipped. ${still}`, "T3 Code reports a pending update");
   }
   const capacity = capacitySufficient(config);
   if (!capacity.ok) {
-    console.error(`t3codectl: update deferred: ${capacity.error}`);
-    return updateExecution(0, "deferred", capacity.error);
+    ui.warn(`Not enough free space: ${capacity.error}`);
+    ui.hint("The next scheduled run will try again.");
+    return updateExecution("deferred", `Update postponed. ${still}`, capacity.error);
   }
   let target: string;
   try {
     target = await latestVersion(config);
   } catch (error) {
     const detail = `unable to resolve latest version: ${error instanceof Error ? error.message : String(error)}`;
-    console.error(`t3codectl: ${detail}`);
-    return updateExecution(1, "failed", detail);
-  }
-  const before = readServiceState(config);
-  if (!before) {
-    const error = "service state is missing or invalid";
-    console.error(`t3codectl: update refused: ${error}`);
-    return updateExecution(1, "failed", error);
-  }
-  if (before.updateStatus === "pending") {
-    const error = "T3 Code reports a pending update";
-    console.error(`t3codectl: update refused: ${error}`);
-    return updateExecution(1, "failed", error);
+    ui.fail(`Could not look up the latest ${config.packageTag} version on npm`);
+    ui.hint(error instanceof Error ? error.message : String(error));
+    return updateExecution("failed", `Update check failed. ${still}`, detail);
   }
   if (before.activeVersion === target) {
-    console.log(`already up to date: ${target}`);
-    return updateExecution(0, "up-to-date");
+    ui.ok(`${target} is the latest ${config.packageTag} version`);
+    return updateExecution("up-to-date", "T3 Code is up to date.");
   }
   if (compareVersions(target, before.activeVersion) !== 1) {
     const error = `refusing non-forward update (${before.activeVersion} → ${target})`;
-    console.error(`t3codectl: ${error}`);
-    return updateExecution(1, "failed", error);
+    ui.fail(`The ${config.packageTag} channel points to ${target}, which is older than the installed ${before.activeVersion}`);
+    ui.hint("t3codectl only updates forward.");
+    return updateExecution("failed", `Update skipped. ${still}`, error);
   }
-  const idleResult = await runtimeIdleState(config);
-  console.log(`idle check: ${idleResult.detail}`);
+  ui.step(`${before.activeVersion} ${ui.paint("→", "dim")} ${ui.paint(target, "bold")}`);
+  const idleResult = await safeIdleState(config);
   if (idleResult.state === "BUSY") {
-    const error = `T3 Code is busy (${idleResult.detail})`;
-    console.log(`update deferred: ${error}`);
-    return updateExecution(0, "deferred", error);
+    ui.warn(`Waiting for agent work to finish: ${idleResult.summary}`);
+    ui.hint("Updating restarts the server and would interrupt them. The next scheduled run will try again.");
+    return updateExecution("deferred", `Update postponed. ${still}`, `T3 Code is busy: ${idleResult.summary}`);
   }
   if (idleResult.state !== "IDLE") {
-    const error = `idle state is unknown (${idleResult.detail})`;
-    console.error(`t3codectl: update refused: ${error}`);
-    return updateExecution(1, "failed", error);
+    ui.fail(`Could not confirm T3 Code is idle: ${idleResult.summary}`);
+    ui.hint("t3codectl will not restart the server while activity is unknown.");
+    return updateExecution("failed", `Update skipped. ${still}`, `idle state is unknown: ${idleResult.summary}`);
   }
+  ui.ok("Safe to restart: no agent work is running");
   const recheck = readServiceState(config);
   if (!recheck || recheck.activeVersion !== before.activeVersion || recheck.updateStatus !== before.updateStatus) {
-    const error = "service state changed during idle check";
-    console.error(`t3codectl: update refused: ${error}`);
-    return updateExecution(1, "failed", error);
+    ui.fail("T3 Code's installed version changed while checking activity");
+    return updateExecution("failed", "Update skipped; try again.", "service state changed during idle check");
   }
-  console.log(`updating T3 Code: ${before.activeVersion} → ${target}`);
-  const updateCode = await reconcile(config, target, target);
+  const installer = await reconcile(config, target, target, false, ui, `Downloading and installing ${target}`);
+  const updateCode = installer.code;
   let verification: HealthResult = { ok: false, reason: `update command failed (exit ${updateCode})` };
-  if (updateCode === 0) verification = await waitForHealth(config, target);
+  if (updateCode === 0) ui.ok(`Installed ${target}`);
+  if (updateCode === 0) verification = await awaitHealthy(ui, config, target, "Waiting for the new server to start", "The server restarted and is healthy");
+  else reportInstallerFailure(ui, "t3 update failed", installer);
   if (updateCode === 0 && verification.ok) {
-    pruneRuntimeVersions(config, target);
-    console.log(`update complete: ${target}`);
-    return updateExecution(0, "updated");
+    const pruned = pruneRuntimeVersions(config, target);
+    if (pruned.removed.length) ui.ok(`Removed ${pruned.removed.length === 1 ? "old runtime" : "old runtimes"} ${pruned.removed.join(", ")}`);
+    if (!pruned.cacheCleaned) ui.warn("Could not clean the npm download cache");
+    return updateExecution("updated", `Updated T3 Code to ${target}.`);
   }
   if (updateCode !== 0) {
     const afterFailure = readServiceState(config);
@@ -1136,24 +1194,25 @@ async function updateLocked(config: Config): Promise<UpdateExecution> {
       : { ok: false, reason: "active-version-changed" };
     if (unchangedHealth.ok) {
       const error = `${verification.reason}; active runtime was unchanged and is still running ${before.activeVersion}`;
-      console.error(`t3codectl: ${error}`);
-      return updateExecution(1, "failed", error);
+      ui.hint(`Nothing was changed; the server is still healthy on ${before.activeVersion}.`);
+      return updateExecution("failed", `Update failed. ${still}`, error);
     }
   }
-  console.error(`t3codectl: update failed: ${verification.reason}; attempting rollback`);
-  if (updateCode === 0) await printStartupDiagnostics(config, verification);
-  const rollbackCode = await reconcile(config, target, before.activeVersion, true);
+  const failure = updateCode === 0 ? describeHealthReason(verification.reason, config.port) : verification.reason;
+  if (updateCode === 0) await printStartupDiagnostics(config);
+  const rollback = await reconcile(config, target, before.activeVersion, true, ui, `Rolling back to ${before.activeVersion}`);
+  const rollbackCode = rollback.code;
   let rollbackVerification: HealthResult = { ok: false, reason: `rollback command failed (exit ${rollbackCode})` };
-  if (rollbackCode === 0) rollbackVerification = await waitForHealth(config, before.activeVersion);
+  if (rollbackCode === 0) rollbackVerification = await awaitHealthy(ui, config, before.activeVersion, "Waiting for the previous version to start", `Rolled back; the server is healthy on ${before.activeVersion}`);
+  else reportInstallerFailure(ui, "Rollback failed", rollback);
   if (rollbackCode === 0 && rollbackVerification.ok) {
-    const error = `update failed: ${verification.reason}; rollback complete; still running ${before.activeVersion}`;
-    console.error(`t3codectl: ${error}`);
-    return updateExecution(1, "failed", error);
+    return updateExecution("failed", `Update failed and was rolled back. ${still}`, `update failed: ${failure}; rolled back to ${before.activeVersion}`);
   }
-  const error = `update failed: ${verification.reason}; rollback failed: ${rollbackVerification.reason}; manual intervention required`;
-  console.error(`t3codectl: ${error}`);
-  if (rollbackCode === 0) await printStartupDiagnostics(config, rollbackVerification);
-  return updateExecution(1, "failed", error);
+  const rollbackFailure = rollbackCode === 0 ? describeHealthReason(rollbackVerification.reason, config.port) : rollbackVerification.reason;
+  if (rollbackCode === 0) await printStartupDiagnostics(config);
+  ui.hint("Run `t3codectl status` and `t3codectl repair`, or inspect the logs above.");
+  return updateExecution("failed", "Update failed and the rollback did not recover the server. T3 Code needs manual attention.",
+    `update failed: ${failure}; rollback failed: ${rollbackFailure}; manual intervention required`);
 }
 
 async function withT3Client<T>(config: Config, action: (client: T3Client) => Promise<T>): Promise<T> {
@@ -1174,13 +1233,23 @@ async function withT3Client<T>(config: Config, action: (client: T3Client) => Pro
   } finally {
     client?.close();
     const revoked = await run(cli, ["auth", "session", "revoke", "--base-dir", config.home, credential.sessionId], { env: systemdEnv(config), timeoutMs: 30000 });
-    if (revoked.code !== 0) console.error("t3codectl: recovery credential revocation failed; it expires within five minutes");
+    if (revoked.code !== 0) new Ui().warn("Could not revoke t3codectl's temporary T3 Code login; it expires within five minutes");
   }
 }
 
-async function recoverCapacityFailures(config: Config): Promise<void> {
-  const result = await withT3Client(config, (client) => recoverThreads({ client, statePath: RECOVERY_STATE_PATH }));
+/** Resume threads that stopped because the model provider was overloaded. */
+async function recoverCapacityFailures(config: Config, ui: Ui): Promise<void> {
+  const result = await withT3Client(config, (client) => recoverThreads({
+    client,
+    statePath: RECOVERY_STATE_PATH,
+    log: (message, level) => (level === "ok" ? ui.ok(message) : ui.warn(message)),
+  }));
+  if (!result.resumed && !result.errors) ui.ok("No threads need resuming after a provider overload");
   if (result.errors) process.exitCode = 1;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function update(args: string[]): Promise<void> {
@@ -1189,32 +1258,38 @@ async function update(args: string[]): Promise<void> {
   if (args.some((arg) => arg !== "--internal-locked")) die(`unknown update option: ${args.find((arg) => arg !== "--internal-locked")}`, 2);
   let config = loadConfig();
   if (internal) {
+    const ui = new Ui();
     const attempt: UpdateAttempt = { protocol: 1, startedAt: new Date().toISOString(), finishedAt: null, result: "running", error: null };
     persistUpdateAttempt(attempt);
+    let execution: UpdateExecution;
     try {
-      config = await applyPendingConfiguration(config);
-      const execution = await updateLocked(config);
-      persistUpdateAttempt({ ...attempt, finishedAt: new Date().toISOString(), result: execution.result, error: execution.error });
-      process.exitCode = execution.code;
+      config = await applyPendingConfiguration(config, ui);
+      execution = await updateLocked(config, ui);
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      persistUpdateAttempt({ ...attempt, finishedAt: new Date().toISOString(), result: "failed", error: detail });
-      process.exitCode = 1;
-      console.error(`t3codectl: update failed: ${detail}`);
+      const detail = errorText(error);
+      ui.fail(detail);
+      execution = updateExecution("failed", "Update stopped by an unexpected error.", detail);
     }
+    persistUpdateAttempt({ ...attempt, finishedAt: new Date().toISOString(), result: execution.result, error: execution.error });
+    process.exitCode = execution.code;
+
+    ui.blank();
+    ui.section("Maintenance");
     try {
-      await recoverCapacityFailures(readPendingConfiguration(config) ?? config);
+      await recoverCapacityFailures(readPendingConfiguration(config) ?? config, ui);
     } catch (error) {
-      console.error(`t3codectl: recovery sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+      ui.warn(`Could not check for threads stopped by a provider overload: ${errorText(error)}`);
       process.exitCode = 1;
     }
     if (installedCli()) {
       try {
-        await updateCli(config);
+        ui.ok(describeCliUpdate(await updateCli(config)));
       } catch (error) {
-        console.error(`t3codectl: self-update failed; will retry at the next scheduled run: ${error instanceof Error ? error.message : String(error)}`);
+        ui.warn(`Could not update t3codectl; the next run will retry: ${errorText(error)}`);
       }
     }
+    ui.blank();
+    ui.verdict(execution.verdict, execution.message);
     return;
   }
   mkdirSync(dirname(config.lockFile), { recursive: true, mode: 0o700 });
@@ -1227,7 +1302,7 @@ async function update(args: string[]): Promise<void> {
     : { command: process.execPath, args: [] };
   const result = await run("/usr/bin/flock", ["-n", "-E", "75", config.lockFile, invocation.command, ...invocation.args, "update", "--internal-locked"], { env: systemdEnv(config), inherit: true });
   if (result.code === 75) {
-    console.log("update deferred: another update is already running");
+    new Ui().verdict("warn", "Another update is already running; nothing to do.");
     process.exitCode = 0;
   } else process.exitCode = result.code;
 }

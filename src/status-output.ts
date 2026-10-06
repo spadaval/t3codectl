@@ -1,3 +1,6 @@
+import { describeHealthReason } from "./health-reason.ts";
+import { colorEnabled, paint } from "./ui.ts";
+
 type LastUpdate = {
   startedAt: string | null;
   result: string;
@@ -23,19 +26,6 @@ type RenderOptions = {
   color?: boolean;
   now?: Date;
 };
-
-const ANSI = {
-  reset: "\u001b[0m",
-  bold: "\u001b[1m",
-  red: "\u001b[31m",
-  green: "\u001b[32m",
-  yellow: "\u001b[33m",
-  cyan: "\u001b[36m",
-};
-
-function paint(value: string, color: keyof typeof ANSI, enabled: boolean): string {
-  return enabled ? `${ANSI[color]}${value}${ANSI.reset}` : value;
-}
 
 function plural(value: number, unit: string): string {
   return `${value} ${unit}${value === 1 ? "" : "s"}`;
@@ -111,10 +101,10 @@ function lastUpdateLine(status: StatusView, color: boolean, now: Date): string {
 }
 
 export function renderStatus(status: StatusView, options: RenderOptions = {}): string {
-  const color = options.color ?? (Boolean(process.stdout.isTTY) && !("NO_COLOR" in process.env) && process.env.TERM !== "dumb");
+  const color = options.color ?? colorEnabled();
   const now = options.now ?? new Date();
   const service = paint(status.active ? "running" : "not running", status.active ? "green" : "red", color);
-  const health = paint(status.health ? "healthy" : `unhealthy (${status.healthReason})`, status.health ? "green" : "red", color);
+  const health = paint(status.health ? "healthy" : `unhealthy: ${describeHealthReason(status.healthReason)}`, status.health ? "green" : "red", color);
   const timerEnabled = status.updateTimer.state === "active";
   const timerState = timerEnabled ? "enabled" : status.updateTimer.state === "inactive" ? "disabled" : status.updateTimer.state;
   const schedule = `${paint(timerState, timerEnabled ? "green" : "red", color)} · ${formatSchedule(status.updateTimer.schedule)}`;
@@ -131,7 +121,8 @@ export function renderStatus(status: StatusView, options: RenderOptions = {}): s
   ];
   if (status.lastUpdate.error) {
     const errorColor = status.lastUpdate.result === "failed" ? "red" : "yellow";
-    lines.push(`  Error      ${paint(status.lastUpdate.error, errorColor, color)}`);
+    const label = status.lastUpdate.result === "failed" ? "Error " : "Reason";
+    lines.push(`  ${label}     ${paint(status.lastUpdate.error, errorColor, color)}`);
   }
   return lines.join("\n");
 }
