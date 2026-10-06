@@ -55,7 +55,13 @@ t3codectl setup
 With a terminal, `setup` presents a guided configuration flow for the T3 Code
 home, reachable hostname or IP, port, release channel, and update schedule.
 It shows a summary and asks for confirmation before making changes. Existing
-configuration values are used as the prompt defaults. Setup preserves comments
+configuration values are used as the prompt defaults. Running instances are
+reconfigured without invoking the native installer. Updater-only changes take
+effect immediately, including a changed timer schedule. Server changes are
+saved and restarted only when T3 is idle; a busy or unreadable instance keeps
+running until a later update sweep can apply them. Pending changes retain the
+old connection settings so recovery can still reach the running server.
+Setup preserves comments
 and unknown/custom variables in the existing configuration file, and accepting
 the existing values does not restart T3 Code unnecessarily.
 
@@ -71,8 +77,8 @@ t3codectl setup \
   --schedule hourly
 ```
 
-`setup` asks T3 Code to install its own background service, so no separate T3
-service-installation step is required. It may create the T3 Code home, then
+`setup` installs T3 Code's native background service when it is missing, so no
+separate service-installation step is required. Existing services are reused. It may create the T3 Code home, then
 adds the updater service, hourly timer, and persistent service drop-in.
 Before changing anything, setup verifies Node.js 22+, npm, and npx, plus
 the required system tools (`systemctl`, `loginctl`, `flock`, `ss`, and `gh`). It does
@@ -149,7 +155,7 @@ The default configuration is `/etc/t3codectl/config.env`.
 
 ## How it works
 
-`setup` asks T3 Code to install or repair its own `t3code.service`, then writes a small
+`setup` reuses an installed `t3code.service`, or asks T3 Code to install it when missing, then writes a small
 systemd drop-in at `~/.config/systemd/user/t3code.service.d/10-t3codectl.conf`
 for the configured host, port, mode, and PATH. It also installs an update
 oneshot service and an hourly systemd timer. The timer invokes the same
@@ -170,8 +176,10 @@ CLI self-updates download the Linux x64 asset to a temporary directory beside
 leaves the installed binary in place. `t3codectl --version` reports the
 installed CLI version.
 
-`repair` performs the same reconciliation using the existing configuration,
-then restarts T3 Code and waits for it to become healthy. If startup fails,
+`repair` reconciles configuration and reinstalls the existing native service at
+its current version,
+then restarts T3 Code when idle and waits for it to become healthy. A busy
+instance retains its pending restart until a later sweep. If startup fails,
 the command reports the health-check reason, port listeners, process details,
 and recent `t3code.service` logs. `repair --stop-conflicting` explicitly stops
 only listeners identified as T3 Code processes outside the configured service,

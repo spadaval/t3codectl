@@ -62,7 +62,8 @@ test("setup can bootstrap an empty T3 Code home through T3", async () => {
 test("repair reconciles and verifies an existing installation", async () => {
   const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const repair = source.slice(source.indexOf("async function repair"), source.indexOf("function promptValue"));
-  assert.match(repair, /applyConfiguration\(loadConfig\(\),/);
+  assert.match(repair, /withConfigurationLock/);
+  assert.match(repair, /forceRestart: true/);
   assert.match(repair, /no existing T3 Code configuration found/);
   assert.match(source, /T3 Code did not become healthy/);
 });
@@ -83,7 +84,7 @@ test("setup preserves unmanaged config content and avoids needless restarts", as
   assert.match(config, /Comments, ordering, and unknown keys/);
   assert.match(config, /mergeManagedConfig/);
   assert.match(source, /if \(content === existing\) return false/);
-  assert.match(source, /if \(dropinChanged \|\| active\.code !== 0\)/);
+  assert.match(source, /configureService/);
   assert.match(source, /setup prerequisites are not ready/);
   assert.match(source, /Node 22 or newer is required/);
   assert.match(source, /Waiting for T3 Code to become healthy/);

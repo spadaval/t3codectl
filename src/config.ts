@@ -60,3 +60,9 @@ export function mergeManagedConfig(existing: string | undefined, values: Record<
 
   return lines.join(newline);
 }
+
+/** Update generated connection URLs when setup changes host/port; preserve explicit custom URLs. */
+export function resolveConnectionUrl(stored: string | undefined, oldHost: string, oldPort: string, host: string, port: number, suffix: string): string {
+  const next = `http://${host}:${port}${suffix}`;
+  return stored === undefined || stored === `http://${oldHost}:${oldPort}${suffix}` ? next : stored;
+}

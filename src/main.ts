@@ -5,12 +5,14 @@ import { existsSync, accessSync, constants, mkdirSync, readFileSync, renameSync,
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { cancel, confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
-import { mergeManagedConfig } from "./config.ts";
+import { mergeManagedConfig, resolveConnectionUrl } from "./config.ts";
 import { readIdleState, readSnapshotIdleState } from "./idle.ts";
 import { parseServiceState, VERSION_RE } from "./service-state.ts";
 import { renderStatus } from "./status-output.ts";
 import { readUpdateAttempt, writeUpdateAttempt, type UpdateAttempt, type UpdateAttemptResult } from "./update-state.ts";
 import { selfUpdate } from "./self-update.ts";
+import { writePending, readPending, pendingConnection, needsNativeRepair, type PendingPhase } from "./pending-config.ts";
+import { belongsToService, configureService, withConfigurationLock } from "./service-setup.ts";
 import { T3Client } from "./t3-client.ts";
 import { recoverThreads } from "./recovery.ts";
 import packageJson from "../package.json";
@@ -18,6 +20,7 @@ import packageJson from "../package.json";
 const CONFIG_PATH = process.env.T3CODECTL_CONFIG ?? "/etc/t3codectl/config.env";
 const INSTALL_PATH = "/usr/local/bin/t3codectl";
 const UPDATE_STATE_PATH = "/var/lib/t3codectl/update-state.json";
+const PENDING_CONFIG_PATH = "/var/lib/t3codectl/pending-configuration.json";
 const RECOVERY_STATE_PATH = "/var/lib/t3codectl/recovery-state.json";
 const DEFAULT_SERVICE_UNIT = "t3code.service";
 const DEFAULT_UPDATE_UNIT = "t3codectl-update.service";
@@ -123,8 +126,8 @@ function loadConfig(overrides: Record<string, string> = {}): Config {
     stateDb: value(values, "T3CODE_STATE_DB", join(home, "userdata/state.sqlite")),
     idleCheck: value(values, "T3CODE_IDLE_CHECK", ""),
     lockFile: value(values, "T3CODE_LOCK_FILE", `/run/user/${process.getuid?.() ?? 0}/t3codectl-update.lock`),
-    healthUrl: value(values, "T3CODE_HEALTH_URL", `http://${host}:${port}/.well-known/t3/environment`),
-    baseUrl: value(values, "T3CODE_BASE_URL", `http://${host}:${port}`),
+    healthUrl: resolveConnectionUrl(values.T3CODE_HEALTH_URL ?? process.env.T3CODE_HEALTH_URL, fileValues.T3CODE_HOST ?? host, fileValues.T3CODE_PORT ?? String(port), host, port, "/.well-known/t3/environment"),
+    baseUrl: resolveConnectionUrl(values.T3CODE_BASE_URL ?? process.env.T3CODE_BASE_URL, fileValues.T3CODE_HOST ?? host, fileValues.T3CODE_PORT ?? String(port), host, port, ""),
     path,
     user,
   };
@@ -202,7 +205,7 @@ async function systemctl(config: Config, args: string[], inherit = false): Promi
 }
 
 async function t3Service(config: Config, command: "install" | "update", version = config.packageTag): Promise<CommandResult> {
-  const env = { ...process.env, HOME: homedir(), PATH: config.path, npm_config_cache: join(config.home, "runtime/npm-cache") };
+  const env = { ...process.env, HOME: homedir(), PATH: config.path, T3CODE_HOST: config.host, T3CODE_PORT: String(config.port), T3CODE_MODE: config.mode, npm_config_cache: join(config.home, "runtime/npm-cache") };
   return run(config.npx, ["-y", `t3@${version}`, "service", command, "--base-dir", config.home], { env, cwd: command === "install" ? homedir() : config.home, inherit: true });
 }
 
@@ -295,7 +298,7 @@ async function portListeners(config: Config): Promise<PortListener[]> {
     const name = readProcFile(pid, "comm").trim() || "unknown";
     const command = readProcFile(pid, "cmdline").replaceAll("\0", " ").trim() || name;
     const cgroup = readProcFile(pid, "cgroup").trim();
-    const inConfiguredService = cgroup.split(/\r?\n/).some((line) => line.endsWith(`:${config.serviceUnit}`));
+    const inConfiguredService = belongsToService(cgroup, config.serviceUnit);
     return { pid, name, command, cgroup, inConfiguredService, looksLikeT3: processLooksLikeT3(name, command) };
   });
 }
@@ -502,40 +505,77 @@ WantedBy=timers.target
   return { update, timer };
 }
 
-async function applyConfiguration(config: Config, options: { interactive?: boolean; stopConflicting?: boolean } = {}): Promise<void> {
+async function applyConfiguration(config: Config, options: { interactive?: boolean; stopConflicting?: boolean; forceRestart?: boolean } = {}): Promise<void> {
   console.log("Checking host prerequisites...");
   const failures = await prerequisiteFailures(config);
   if (failures.length > 0) die(`setup prerequisites are not ready:\n${failures.map((failure) => `- ${failure}`).join("\n")}`, 2);
   await resolvePreexistingPortConflict(config, options);
   const dropin = renderT3Dropin(config);
   const units = renderUnits(config);
-  const nativeInstall = await withProgress(
-    "Installing or repairing T3 Code's native service (this may take several minutes)...",
-    () => t3Service(config, "install"),
-  );
-  if (nativeInstall.code !== 0) die(`T3 Code service installation failed (exit ${nativeInstall.code})${nativeInstall.stderr.trim() ? `: ${nativeInstall.stderr.trim()}` : ""}`);
-  console.log("Writing t3codectl configuration and management units...");
-  const configChanged = writeConfig(config);
-  mkdirSync(unitDirectory(), { recursive: true, mode: 0o700 });
-  mkdirSync(dropinDirectory(config.serviceUnit), { recursive: true, mode: 0o700 });
-  const dropinChanged = writeManagedFile(dropinPath(config.serviceUnit), dropin, 0o644);
-  const updateUnitChanged = writeManagedFile(unitPath(config.updateUnit), units.update, 0o644);
-  const timerUnitChanged = writeManagedFile(unitPath(config.timerUnit), units.timer, 0o644);
-  if (dropinChanged || updateUnitChanged || timerUnitChanged) {
-    console.log("Reloading systemd user units...");
-    const reloaded = await systemctl(config, ["daemon-reload"]);
-    if (reloaded.code !== 0) die(`systemd daemon-reload failed (exit ${reloaded.code})${reloaded.stderr.trim() ? `: ${reloaded.stderr.trim()}` : ""}`);
+  const previous = readPendingConfiguration(config) ?? loadConfig();
+  const service = await systemctl(config, ["show", config.serviceUnit, "-p", "LoadState", "-p", "FragmentPath"]);
+  const fields = parseKeyValueOutput(service.stdout);
+  if (service.code !== 0) die("could not inspect the existing T3 Code service");
+  const installed = fields.LoadState === "loaded" && Boolean(fields.FragmentPath);
+  if (fields.LoadState !== "loaded" && fields.LoadState !== "not-found") die(`cannot configure service in state ${fields.LoadState ?? "unknown"}`);
+  const wasActive = (await systemctl(config, ["is-active", "--quiet", config.serviceUnit])).code === 0;
+  if (installed && config.home !== previous.home) die("changing an installed service's T3 home requires an explicit migration; existing service left unchanged", 2);
+  let configChanged = false, dropinChanged = false, updateUnitChanged = false, timerUnitChanged = false;
+  const pendingRecord = readPendingRecord(config);
+  const pending = pendingRecord !== null;
+  const alreadyApplied = pendingRecord?.restartCompleted === true;
+  const nativeRepair = needsNativeRepair(pendingRecord, options.forceRestart === true);
+  const lifecycle = await configureService({
+    installed,
+    forceRestart: nativeRepair,
+    install: async () => {
+      const result = await withProgress("Installing T3 Code's native service...", () => t3Service(config, "install"));
+      if (result.code !== 0) throw new Error(`T3 Code service installation failed (exit ${result.code})`);
+    },
+    write: async () => {
+      // Record the old endpoint before writing changed server settings.
+      const serverChanged = !existsSync(dropinPath(config.serviceUnit)) || readFileSync(dropinPath(config.serviceUnit), "utf8") !== dropin;
+      if (wasActive && (serverChanged || (pending && !alreadyApplied) || options.forceRestart)) writePendingConfiguration(previous, { nativeRepair });
+      console.log("Writing t3codectl configuration and management units...");
+      configChanged = writeConfig(config);
+      mkdirSync(unitDirectory(), { recursive: true, mode: 0o700 });
+      mkdirSync(dropinDirectory(config.serviceUnit), { recursive: true, mode: 0o700 });
+      dropinChanged = writeManagedFile(dropinPath(config.serviceUnit), dropin, 0o644);
+      updateUnitChanged = writeManagedFile(unitPath(config.updateUnit), units.update, 0o644);
+      timerUnitChanged = writeManagedFile(unitPath(config.timerUnit), units.timer, 0o644);
+      if (dropinChanged || updateUnitChanged || timerUnitChanged) {
+        const reloaded = await systemctl(config, ["daemon-reload"]);
+        if (reloaded.code !== 0) throw new Error("systemd daemon-reload failed");
+      }
+      const enabled = await systemctl(config, ["enable", "--now", config.timerUnit]);
+      if (enabled.code !== 0) throw new Error("could not enable the update timer");
+      if (timerUnitChanged) {
+        const restarted = await systemctl(config, ["restart", config.timerUnit]);
+        if (restarted.code !== 0) throw new Error("could not apply the update timer schedule");
+      }
+      return { serverChanged: dropinChanged, restartPending: pending && !alreadyApplied };
+    },
+    active: async () => (await systemctl(config, ["is-active", "--quiet", config.serviceUnit])).code === 0,
+    idle: async () => (await runtimeIdleState(previous)).state === "IDLE",
+    markPending: () => writePendingConfiguration(previous, { nativeRepair }),
+    start: async () => {
+      const result = await systemctl(config, ["start", config.serviceUnit]);
+      if (result.code !== 0) throw new Error("T3 Code service failed to start");
+      writePendingConfiguration(previous, { restartCompleted: true, applied: config });
+    },
+    restart: async () => {
+      const result = await systemctl(config, ["restart", config.serviceUnit]);
+      if (result.code !== 0) throw new Error("T3 Code service failed to restart");
+      writePendingConfiguration(previous, { restartCompleted: true, applied: config });
+    },
+    ...(nativeRepair ? { repairExisting: () => repairNativeService(config, previous) } : {}),
+  });
+  if (lifecycle === "deferred") {
+    console.log("Server settings saved; restart pending until T3 Code is idle. The running server was left in place.");
+    console.log(`configured and enabled ${config.timerUnit} (${config.schedule})`);
+    return;
   }
-  console.log(`Enabling update timer (${config.schedule})...`);
-  const timer = await systemctl(config, ["enable", "--now", config.timerUnit]);
-  if (timer.code !== 0) die(`could not enable update timer ${config.timerUnit} (exit ${timer.code})${timer.stderr.trim() ? `: ${timer.stderr.trim()}` : ""}`);
-  const active = await systemctl(config, ["is-active", "--quiet", config.serviceUnit]);
   let restartFailure: string | undefined;
-  if (dropinChanged || active.code !== 0) {
-    console.log(active.code === 0 ? "Applying T3 Code service settings..." : "Starting T3 Code service...");
-    const started = await systemctl(config, ["restart", config.serviceUnit]);
-    if (started.code !== 0) restartFailure = started.stderr.trim() || "T3 Code service failed to start";
-  }
   const serviceState = readServiceState(config);
   let healthy: HealthResult = restartFailure
     ? { ok: false, reason: "service-restart-failed" }
@@ -551,7 +591,8 @@ async function applyConfiguration(config: Config, options: { interactive?: boole
     });
   }
   if (!healthy.ok) die(startupFailureMessage(config, healthy, restartFailure), 1);
-  if (!configChanged && !dropinChanged && !updateUnitChanged && !timerUnitChanged && active.code === 0) console.log("configuration already applied; no service restart needed");
+  if (existsSync(PENDING_CONFIG_PATH)) unlinkSync(PENDING_CONFIG_PATH);
+  if (!configChanged && !dropinChanged && !updateUnitChanged && !timerUnitChanged && lifecycle === "unchanged") console.log("configuration already applied; no service restart needed");
   console.log(`configured ${config.serviceUnit} through T3 Code`);
   console.log(`configured ${dropinPath(config.serviceUnit)}`);
   console.log(`configured and enabled ${config.timerUnit} (${config.schedule})`);
@@ -614,13 +655,13 @@ async function setup(args: string[]): Promise<void> {
       `Release channel: ${config.packageTag}`,
       `Update schedule: ${config.schedule}`,
       "",
-      "T3 Code will install or repair its native service.",
+      "Existing services will be reconfigured; missing services will be installed.",
       "t3codectl will install the updater timer and service drop-in.",
     ].join("\n"), "Configuration");
     const proceed = promptValue(await confirm({ message: "Apply this configuration?", initialValue: true }));
     if (!proceed) cancelSetup();
   }
-  await applyConfiguration(config, { interactive });
+  await withConfigurationLock(config.lockFile, () => applyConfiguration(config, { interactive }));
   if (interactive) outro("T3 Code setup complete");
 }
 
@@ -633,8 +674,9 @@ async function repair(args: string[]): Promise<void> {
   const configFileValues = parseEnvFile(CONFIG_PATH);
   if (!configFileValues.T3CODE_HOST && !process.env.T3CODE_HOST) die("no existing T3 Code configuration found; run `t3codectl setup` first", 2);
   console.log("Repairing the existing T3 Code installation...");
-  await applyConfiguration(loadConfig(), { interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) && !nonInteractive, stopConflicting });
-  console.log("T3 Code repair complete");
+  const config = loadConfig();
+  await withConfigurationLock(config.lockFile, () => applyConfiguration(config, { interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) && !nonInteractive, stopConflicting, forceRestart: true }));
+  console.log("T3 Code repair configuration applied");
 }
 
 function promptValue<T>(valueToCheck: T | symbol): T {
@@ -959,6 +1001,67 @@ async function selfUpdateCommand(args: string[]): Promise<void> {
   process.exitCode = result.code;
 }
 
+function writePendingConfiguration(previous: Config, phase: PendingPhase<Config> = {}): void {
+  writePending(PENDING_CONFIG_PATH, previous, phase);
+}
+
+function readPendingRecord(config: Config) {
+  return readPending(PENDING_CONFIG_PATH, config);
+}
+
+function readPendingConfiguration(config: Config): Config | null {
+  return pendingConnection(readPendingRecord(config));
+}
+
+async function repairNativeService(config: Config, previous: Config): Promise<void> {
+  const state = readServiceState(previous);
+  if (!state) throw new Error("cannot repair native service without a valid installed runtime");
+  writePendingConfiguration(previous, { nativeRepair: true });
+  const stopped = await systemctl(config, ["stop", config.serviceUnit]);
+  if (stopped.code !== 0) throw new Error("could not stop the idle service for native repair");
+  const result = await withProgress("Repairing the installed native T3 Code service...", () => t3Service(config, "install", state.activeVersion));
+  if (result.code !== 0) throw new Error("native T3 Code service repair failed");
+  writePendingConfiguration(previous, { restartCompleted: true, applied: config });
+}
+
+async function runtimeIdleState(config: Config) {
+  return existsSync(join(dirname(config.stateDb), "statev2.sqlite"))
+    ? withT3Client(config, async (client) => readSnapshotIdleState(await client.get("/api/orchestration/shell")))
+    : readIdleState(config.stateDb);
+}
+
+async function applyPendingConfiguration(config: Config): Promise<Config> {
+  const previous = readPendingConfiguration(config);
+  if (!previous) return config;
+  const record = readPendingRecord(config)!;
+  if (record.restartCompleted === true) {
+    if (renderT3Dropin(record.applied!) !== renderT3Dropin(config)) throw new Error("server settings changed after restart; run setup again");
+    const verified = await waitForHealth(record.applied!);
+    if (!verified.ok) throw new Error(`pending server configuration failed verification: ${verified.reason}`);
+    unlinkSync(PENDING_CONFIG_PATH);
+    return config;
+  }
+  const stoppedForRepair = record.nativeRepair && (await systemctl(config, ["is-active", "--quiet", config.serviceUnit])).code !== 0;
+  const idle = stoppedForRepair ? { state: "IDLE", detail: "native repair service stopped" } : await runtimeIdleState(previous);
+  if (idle.state !== "IDLE") {
+    console.log(`server configuration restart deferred: ${idle.detail}`);
+    return previous;
+  }
+  if (readFileSync(dropinPath(config.serviceUnit), "utf8") !== renderT3Dropin(config)) throw new Error("pending server settings differ from configuration; run setup again");
+  await resolvePreexistingPortConflict(config, { interactive: false });
+  if (record.nativeRepair) await repairNativeService(config, previous);
+  else {
+    const result = await systemctl(config, ["restart", config.serviceUnit]);
+    if (result.code !== 0) throw new Error("pending server configuration restart failed");
+    writePendingConfiguration(previous, { restartCompleted: true, applied: config });
+  }
+  const verified = await waitForHealth(config);
+  if (!verified.ok) throw new Error(`pending server configuration failed verification: ${verified.reason}`);
+  unlinkSync(PENDING_CONFIG_PATH);
+  console.log("pending server configuration applied");
+  return config;
+}
+
 async function updateLocked(config: Config): Promise<UpdateExecution> {
   const active = await systemctl(config, ["is-active", "--quiet", config.serviceUnit]);
   if (active.code !== 0) {
@@ -999,9 +1102,7 @@ async function updateLocked(config: Config): Promise<UpdateExecution> {
     console.error(`t3codectl: ${error}`);
     return updateExecution(1, "failed", error);
   }
-  const idleResult = existsSync(join(dirname(config.stateDb), "statev2.sqlite"))
-    ? await withT3Client(config, async (client) => readSnapshotIdleState(await client.get("/api/orchestration/shell")))
-    : readIdleState(config.stateDb);
+  const idleResult = await runtimeIdleState(config);
   console.log(`idle check: ${idleResult.detail}`);
   if (idleResult.state === "BUSY") {
     const error = `T3 Code is busy (${idleResult.detail})`;
@@ -1086,11 +1187,12 @@ async function update(args: string[]): Promise<void> {
   if (args.includes("--help")) { printHelp(); return; }
   const internal = args.includes("--internal-locked");
   if (args.some((arg) => arg !== "--internal-locked")) die(`unknown update option: ${args.find((arg) => arg !== "--internal-locked")}`, 2);
-  const config = loadConfig();
+  let config = loadConfig();
   if (internal) {
     const attempt: UpdateAttempt = { protocol: 1, startedAt: new Date().toISOString(), finishedAt: null, result: "running", error: null };
     persistUpdateAttempt(attempt);
     try {
+      config = await applyPendingConfiguration(config);
       const execution = await updateLocked(config);
       persistUpdateAttempt({ ...attempt, finishedAt: new Date().toISOString(), result: execution.result, error: execution.error });
       process.exitCode = execution.code;
@@ -1101,7 +1203,7 @@ async function update(args: string[]): Promise<void> {
       console.error(`t3codectl: update failed: ${detail}`);
     }
     try {
-      await recoverCapacityFailures(config);
+      await recoverCapacityFailures(readPendingConfiguration(config) ?? config);
     } catch (error) {
       console.error(`t3codectl: recovery sweep failed: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
@@ -1145,7 +1247,7 @@ async function uninstall(args: string[]): Promise<void> {
     await systemctl(config, ["disable", "--now", unit]);
   }
   await systemctl(config, ["daemon-reload"]);
-  const allowed = [unitPath(config.timerUnit), unitPath(config.updateUnit), dropinPath(config.serviceUnit), config.configPath, UPDATE_STATE_PATH, RECOVERY_STATE_PATH, INSTALL_PATH];
+  const allowed = [unitPath(config.timerUnit), unitPath(config.updateUnit), dropinPath(config.serviceUnit), config.configPath, UPDATE_STATE_PATH, RECOVERY_STATE_PATH, PENDING_CONFIG_PATH, INSTALL_PATH];
   for (const path of allowed) if (existsSync(path)) unlinkSync(path);
   console.log("removed t3codectl updater units, service drop-in, and configuration");
   console.log(`left ${config.serviceUnit} under T3 Code ownership`);
