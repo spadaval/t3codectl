@@ -110,8 +110,8 @@ Run an update manually at any time with:
 t3codectl update
 ```
 
-The same command runs on the hourly timer. It completes the T3 Code update
-attempt, then checks the latest stable `t3codectl` GitHub release and installs
+The same command runs on the configured timer (hourly by default). It completes
+the T3 Code update attempt, scans for provider capacity failures, then checks the latest stable `t3codectl` GitHub release and installs
 a newer CLI automatically. The updated CLI is used on the next run. The GitHub
 account configured with `gh auth login` must retain access to this private
 repository. If the CLI release check fails, the T3 Code result is preserved
@@ -119,6 +119,28 @@ and the CLI check retries on the next timer run.
 Run `t3codectl self-update` to update only the CLI.
 Hosts running an older CLI need this release installed once using the download
 steps above; subsequent CLI releases are installed by the timer.
+
+Each sweep uses a short-lived local auth credential to read T3's orchestration
+API across projects. It resumes at most one eligible thread by sending a
+continuation message in the existing thread, keeping its provider, model,
+permissions, workspace, and conversation. Scanning does not call a model.
+Recovery also runs when the version is current, the update is deferred, or the
+update check fails. An unavailable server or unsupported protocol reports a
+recovery error without changing T3 data directly.
+
+Only explicit provider capacity/overload errors are retried. Quota, rate-limit,
+billing, authentication, and unrelated failures are left for the user. Archived,
+settled, snoozed, cancelled, busy, approval-waiting, and delegated subagent threads
+are excluded. The first retry waits at least five minutes; further automatic
+attempts wait 1, 2, 4, then 8 hours, with a maximum of five retries per failure
+chain. Manual continuation starts a new chain. Durable command IDs prevent
+uncertain delivery from creating duplicate runs after a timeout or process crash.
+State is stored at `/var/lib/t3codectl/recovery-state.json`.
+
+The sweep rechecks thread state immediately before sending. T3's protocol does
+not offer an atomic capacity-failure continuation guard, so a simultaneous manual
+send can still race the final check and queue the recovery message. Recovery
+never steers or interrupts an active turn.
 
 For a stable release channel, use `--package latest` instead of
 `--package nightly` during setup.
@@ -162,6 +184,11 @@ deployment settings managed here.
 After a successful update, the active runtime and the two newest previous
 runtime versions are retained. The configured npm cache is then cleaned to
 prevent unattended updates from consuming the host disk.
+
+On installations with T3's V2 database, the updater checks the authenticated
+orchestration snapshot before restarting the service. Running, queued, preparing,
+waiting, and background work defer the update; unreadable or unknown states block
+it. Legacy installations retain the read-only database idle check.
 
 Updates use T3 Code's native `t3 update` command with an exact version and
 automatic service restart approval. The updater enables Node's environment

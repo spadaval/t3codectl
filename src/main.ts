@@ -6,16 +6,19 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { cancel, confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
 import { mergeManagedConfig } from "./config.ts";
-import { readIdleState } from "./idle.ts";
+import { readIdleState, readSnapshotIdleState } from "./idle.ts";
 import { parseServiceState, VERSION_RE } from "./service-state.ts";
 import { renderStatus } from "./status-output.ts";
 import { readUpdateAttempt, writeUpdateAttempt, type UpdateAttempt, type UpdateAttemptResult } from "./update-state.ts";
 import { selfUpdate } from "./self-update.ts";
+import { T3Client } from "./t3-client.ts";
+import { recoverThreads } from "./recovery.ts";
 import packageJson from "../package.json";
 
 const CONFIG_PATH = process.env.T3CODECTL_CONFIG ?? "/etc/t3codectl/config.env";
 const INSTALL_PATH = "/usr/local/bin/t3codectl";
 const UPDATE_STATE_PATH = "/var/lib/t3codectl/update-state.json";
+const RECOVERY_STATE_PATH = "/var/lib/t3codectl/recovery-state.json";
 const DEFAULT_SERVICE_UNIT = "t3code.service";
 const DEFAULT_UPDATE_UNIT = "t3codectl-update.service";
 const DEFAULT_TIMER_UNIT = "t3codectl-update.timer";
@@ -174,10 +177,11 @@ function systemdEnv(config: Config): NodeJS.ProcessEnv {
   };
 }
 
-function run(command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; input?: string; inherit?: boolean } = {}): Promise<CommandResult> {
+function run(command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; input?: string; inherit?: boolean; timeoutMs?: number } = {}): Promise<CommandResult> {
   return new Promise((resolveResult) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
+      timeout: options.timeoutMs,
       env: options.env ?? process.env,
       stdio: options.inherit ? "inherit" : ["pipe", "pipe", "pipe"],
     });
@@ -995,7 +999,9 @@ async function updateLocked(config: Config): Promise<UpdateExecution> {
     console.error(`t3codectl: ${error}`);
     return updateExecution(1, "failed", error);
   }
-  const idleResult = readIdleState(config.stateDb);
+  const idleResult = existsSync(join(dirname(config.stateDb), "statev2.sqlite"))
+    ? await withT3Client(config, async (client) => readSnapshotIdleState(await client.get("/api/orchestration/shell")))
+    : readIdleState(config.stateDb);
   console.log(`idle check: ${idleResult.detail}`);
   if (idleResult.state === "BUSY") {
     const error = `T3 Code is busy (${idleResult.detail})`;
@@ -1049,6 +1055,33 @@ async function updateLocked(config: Config): Promise<UpdateExecution> {
   return updateExecution(1, "failed", error);
 }
 
+async function withT3Client<T>(config: Config, action: (client: T3Client) => Promise<T>): Promise<T> {
+  const state = readServiceState(config);
+  if (!state || state.updateStatus === "pending") throw new Error("T3 runtime is unavailable or updating");
+  // Use the installed runtime: recovery must not require npm or a model call.
+  const cli = join(config.home, "runtime/versions", state.activeVersion, "t3");
+  if (!existsSync(cli)) throw new Error("installed T3 CLI is unavailable");
+  const auth = await run(cli, ["auth", "session", "issue", "--base-dir", config.home, "--label", "t3codectl-recovery", "--ttl", "5m", "--json"], { env: systemdEnv(config), timeoutMs: 30000 });
+  if (auth.code !== 0) throw new Error("could not issue a T3 recovery credential");
+  let credential: { token: string; sessionId: string };
+  try { credential = JSON.parse(auth.stdout); } catch { throw new Error("invalid T3 credential response"); }
+  if (typeof credential?.token !== "string" || typeof credential?.sessionId !== "string") throw new Error("invalid T3 credential fields");
+  let client: T3Client | undefined;
+  try {
+    client = new T3Client(config.baseUrl, credential.token);
+    return await action(client);
+  } finally {
+    client?.close();
+    const revoked = await run(cli, ["auth", "session", "revoke", "--base-dir", config.home, credential.sessionId], { env: systemdEnv(config), timeoutMs: 30000 });
+    if (revoked.code !== 0) console.error("t3codectl: recovery credential revocation failed; it expires within five minutes");
+  }
+}
+
+async function recoverCapacityFailures(config: Config): Promise<void> {
+  const result = await withT3Client(config, (client) => recoverThreads({ client, statePath: RECOVERY_STATE_PATH }));
+  if (result.errors) process.exitCode = 1;
+}
+
 async function update(args: string[]): Promise<void> {
   if (args.includes("--help")) { printHelp(); return; }
   const internal = args.includes("--internal-locked");
@@ -1064,7 +1097,14 @@ async function update(args: string[]): Promise<void> {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       persistUpdateAttempt({ ...attempt, finishedAt: new Date().toISOString(), result: "failed", error: detail });
-      throw error;
+      process.exitCode = 1;
+      console.error(`t3codectl: update failed: ${detail}`);
+    }
+    try {
+      await recoverCapacityFailures(config);
+    } catch (error) {
+      console.error(`t3codectl: recovery sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
     }
     if (installedCli()) {
       try {
@@ -1105,7 +1145,7 @@ async function uninstall(args: string[]): Promise<void> {
     await systemctl(config, ["disable", "--now", unit]);
   }
   await systemctl(config, ["daemon-reload"]);
-  const allowed = [unitPath(config.timerUnit), unitPath(config.updateUnit), dropinPath(config.serviceUnit), config.configPath, UPDATE_STATE_PATH, INSTALL_PATH];
+  const allowed = [unitPath(config.timerUnit), unitPath(config.updateUnit), dropinPath(config.serviceUnit), config.configPath, UPDATE_STATE_PATH, RECOVERY_STATE_PATH, INSTALL_PATH];
   for (const path of allowed) if (existsSync(path)) unlinkSync(path);
   console.log("removed t3codectl updater units, service drop-in, and configuration");
   console.log(`left ${config.serviceUnit} under T3 Code ownership`);
@@ -1120,7 +1160,7 @@ Commands:
   repair      Reconcile the existing installation and restart T3 Code
   status      Show service health, versions, update schedule, and last attempt
   pair        Generate a fresh T3 Code pairing URL
-  update      Apply the latest version when T3 Code is idle
+  update      Update when idle and recover provider capacity failures
   self-update Update the t3codectl executable from its latest GitHub release
   uninstall   Remove management units and config; never removes T3 Code data
 

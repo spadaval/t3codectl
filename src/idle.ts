@@ -34,3 +34,16 @@ export function readIdleState(stateDb: string): IdleResult {
     db?.close();
   }
 }
+
+/** V2 runs live in a separate database; the authenticated shell is its public read boundary. */
+export function readSnapshotIdleState(snapshot: any): IdleResult {
+  if (snapshot?.schemaVersion !== 2 || !Array.isArray(snapshot.threads) || !Array.isArray(snapshot.archivedThreads)) return { state: "UNKNOWN", detail: "unsupported-orchestration-snapshot" };
+  const terminal = new Set(["idle", "completed", "failed", "cancelled", "interrupted", "rolled_back"]);
+  const active = new Set(["preparing", "queued", "starting", "running", "waiting"]);
+  let busy = 0, unknown = 0;
+  for (const thread of [...snapshot.threads, ...snapshot.archivedThreads]) {
+    if (!thread || typeof thread.status !== "string" || (!terminal.has(thread.status) && !active.has(thread.status))) { unknown++; continue; }
+    if (active.has(thread.status) || thread.activeRunId != null || thread.pendingRuntimeRequest != null || thread.pendingBackgroundTasks?.length) busy++;
+  }
+  return { state: unknown ? "UNKNOWN" : busy ? "BUSY" : "IDLE", detail: `v2|unknown=${unknown}|busy=${busy}` };
+}
